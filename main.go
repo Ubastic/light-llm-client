@@ -7,22 +7,11 @@ import (
 	"light-llm-client/ui"
 	"light-llm-client/utils"
 	"os"
-	"runtime"
-	"syscall"
 )
 
 var (
 	version = "0.1.0"
 )
-
-func init() {
-	// Set UTF-8 encoding for Windows console
-	if runtime.GOOS == "windows" {
-		kernel32 := syscall.NewLazyDLL("kernel32.dll")
-		setConsoleOutputCP := kernel32.NewProc("SetConsoleOutputCP")
-		setConsoleOutputCP.Call(uintptr(65001)) // 65001 is UTF-8
-	}
-}
 
 func main() {
 	// Parse command line flags
