@@ -13,6 +13,7 @@ type Config struct {
 	UI           UIConfig                  `json:"ui"`
 	Data         DataConfig                `json:"data"`
 	Proxy        ProxyConfig               `json:"proxy"`
+	Privacy      PrivacyConfig             `json:"privacy"`
 }
 
 // ProviderConfig represents LLM provider configuration
@@ -46,6 +47,16 @@ type DataConfig struct {
 type ProxyConfig struct {
 	Enabled bool   `json:"enabled"`
 	URL     string `json:"url"`
+}
+
+// PrivacyConfig represents privacy and anonymization configuration
+type PrivacyConfig struct {
+	AnonymizeSensitiveData bool `json:"anonymize_sensitive_data"`
+	AnonymizeURLs          bool `json:"anonymize_urls"`
+	AnonymizeAPIKeys       bool `json:"anonymize_api_keys"`
+	AnonymizeEmails        bool `json:"anonymize_emails"`
+	AnonymizeIPAddresses   bool `json:"anonymize_ip_addresses"`
+	AnonymizeFilePaths     bool `json:"anonymize_file_paths"`
 }
 
 // LoadConfig loads configuration from file

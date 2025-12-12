@@ -94,5 +94,13 @@
   "proxy": {
     "enabled": false,
     "url": ""
+  },
+  "privacy": {
+    "anonymize_sensitive_data": false,
+    "anonymize_urls": true,
+    "anonymize_api_keys": true,
+    "anonymize_emails": true,
+    "anonymize_ip_addresses": true,
+    "anonymize_file_paths": false
   }
 }

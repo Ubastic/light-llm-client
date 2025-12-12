@@ -25,6 +25,7 @@ type App struct {
 	db         *db.DB
 	logger     *utils.Logger
 	providers  map[string]llm.Provider
+	anonymizer *utils.Anonymizer
 
 	// UI components
 	sidebar               *ConversationSidebar
@@ -66,6 +67,7 @@ func NewApp(config *utils.Config, configPath string, database *db.DB, logger *ut
 		db:         database,
 		logger:     logger,
 		providers:  make(map[string]llm.Provider),
+		anonymizer: utils.NewAnonymizer(config.Privacy.AnonymizeSensitiveData),
 		chatViews:  make(map[int64]*ChatView),
 		tabItems:   make(map[int64]*CustomTab),
 		messageCache: make(map[int64][]*db.Message),

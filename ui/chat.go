@@ -512,11 +512,22 @@ func (cv *ChatView) sendMessage() {
 			}
 		}
 		
+		// Anonymize message content before sending to LLM
+		anonymizedContent := cv.app.anonymizer.Anonymize(msg.Content)
+		
 		llmMessages = append(llmMessages, llm.Message{
 			Role:        msg.Role,
-			Content:     msg.Content,
+			Content:     anonymizedContent,
 			Attachments: imageAttachments,
 		})
+	}
+	
+	// Log anonymization stats if enabled
+	if cv.app.anonymizer.IsEnabled() {
+		mappingCount := cv.app.anonymizer.GetMappingCount()
+		if mappingCount > 0 {
+			cv.app.logger.Info("Anonymized %d sensitive values before sending to LLM", mappingCount)
+		}
 	}
 
 	// Create placeholder for assistant response with RichText
@@ -545,6 +556,8 @@ func (cv *ChatView) sendMessage() {
 		if err != nil {
 			cv.app.logger.Error("Failed to start chat: %v", err)
 			errorMsg := "**错误**: " + err.Error()
+			// Deanonymize error message in case it contains sensitive info
+			errorMsg = cv.app.anonymizer.Deanonymize(errorMsg)
 			fyne.Do(func() {
 				assistantRichText.ParseMarkdown(errorMsg)
 			})
@@ -561,6 +574,8 @@ func (cv *ChatView) sendMessage() {
 			if saveErr != nil {
 				cv.app.logger.Error("Failed to save error message: %v", saveErr)
 			}
+			// Clear anonymization mappings
+			cv.app.anonymizer.Clear()
 			// Reload to show retry button
 			cv.loadMessages()
 			return
@@ -571,6 +586,8 @@ func (cv *ChatView) sendMessage() {
 			if chunk.Error != nil {
 				cv.app.logger.Error("Stream error: %v", chunk.Error)
 				errorMsg := "**错误**: " + chunk.Error.Error()
+				// Deanonymize error message in case it contains sensitive info
+				errorMsg = cv.app.anonymizer.Deanonymize(errorMsg)
 				fyne.Do(func() {
 					assistantRichText.ParseMarkdown(errorMsg)
 				})
@@ -587,6 +604,8 @@ func (cv *ChatView) sendMessage() {
 				if saveErr != nil {
 					cv.app.logger.Error("Failed to save error message: %v", saveErr)
 				}
+				// Clear anonymization mappings
+				cv.app.anonymizer.Clear()
 				// Reload to show retry button
 				cv.loadMessages()
 				break
@@ -594,20 +613,24 @@ func (cv *ChatView) sendMessage() {
 
 			if chunk.Content != "" {
 				fullResponse.WriteString(chunk.Content)
+				// Deanonymize the accumulated content for display
+				content := cv.app.anonymizer.Deanonymize(fullResponse.String())
 				// Update RichText with accumulated markdown content
 				// ParseMarkdown re-renders the entire content for proper markdown context
-				content := fullResponse.String()
 				fyne.Do(func() {
 					assistantRichText.ParseMarkdown(content)
 				})
 			}
 
 			if chunk.Done {
-				// Save assistant message
+				// Deanonymize the final response before saving
+				finalResponse := cv.app.anonymizer.Deanonymize(fullResponse.String())
+				
+				// Save assistant message (with original sensitive data restored)
 				_, err := cv.app.db.CreateMessage(
 					cv.conversationID,
 					"assistant",
-					fullResponse.String(),
+					finalResponse,
 					cv.currentProvider,
 					cv.currentProvider,
 					"",
@@ -616,6 +639,9 @@ func (cv *ChatView) sendMessage() {
 				if err != nil {
 					cv.app.logger.Error("Failed to save assistant message: %v", err)
 				}
+				
+				// Clear anonymization mappings for next conversation turn
+				cv.app.anonymizer.Clear()
 				
 				// Auto-generate title if this is the first exchange
 				utils.SafeGo(cv.app.logger, "autoGenerateTitle", cv.autoGenerateTitle)
@@ -1367,10 +1393,20 @@ func (cv *ChatView) regenerateMessage(messageIndex int) {
 	// Prepare messages for LLM (exclude the message to regenerate and all after it)
 	llmMessages := []llm.Message{}
 	for i := 0; i < messageIndex; i++ {
+		// Anonymize message content before sending to LLM
+		anonymizedContent := cv.app.anonymizer.Anonymize(dbMessages[i].Content)
 		llmMessages = append(llmMessages, llm.Message{
 			Role:    dbMessages[i].Role,
-			Content: dbMessages[i].Content,
+			Content: anonymizedContent,
 		})
+	}
+	
+	// Log anonymization stats if enabled
+	if cv.app.anonymizer.IsEnabled() {
+		mappingCount := cv.app.anonymizer.GetMappingCount()
+		if mappingCount > 0 {
+			cv.app.logger.Info("Anonymized %d sensitive values before regenerating", mappingCount)
+		}
 	}
 
 	// Remove all messages from the regenerated one onwards from UI
@@ -1406,6 +1442,8 @@ func (cv *ChatView) regenerateMessage(messageIndex int) {
 		if err != nil {
 			cv.app.logger.Error("Failed to start chat: %v", err)
 			errorMsg := "**错误**: " + err.Error()
+			// Deanonymize error message in case it contains sensitive info
+			errorMsg = cv.app.anonymizer.Deanonymize(errorMsg)
 			fyne.Do(func() {
 				assistantRichText.ParseMarkdown(errorMsg)
 			})
@@ -1422,6 +1460,8 @@ func (cv *ChatView) regenerateMessage(messageIndex int) {
 			if saveErr != nil {
 				cv.app.logger.Error("Failed to save error message: %v", saveErr)
 			}
+			// Clear anonymization mappings
+			cv.app.anonymizer.Clear()
 			// Reload to show retry button
 			cv.loadMessages()
 			return
@@ -1432,6 +1472,8 @@ func (cv *ChatView) regenerateMessage(messageIndex int) {
 			if chunk.Error != nil {
 				cv.app.logger.Error("Stream error: %v", chunk.Error)
 				errorMsg := "**错误**: " + chunk.Error.Error()
+				// Deanonymize error message in case it contains sensitive info
+				errorMsg = cv.app.anonymizer.Deanonymize(errorMsg)
 				fyne.Do(func() {
 					assistantRichText.ParseMarkdown(errorMsg)
 				})
@@ -1448,6 +1490,8 @@ func (cv *ChatView) regenerateMessage(messageIndex int) {
 				if saveErr != nil {
 					cv.app.logger.Error("Failed to save error message: %v", saveErr)
 				}
+				// Clear anonymization mappings
+				cv.app.anonymizer.Clear()
 				// Reload to show retry button
 				cv.loadMessages()
 				break
@@ -1455,18 +1499,22 @@ func (cv *ChatView) regenerateMessage(messageIndex int) {
 
 			if chunk.Content != "" {
 				fullResponse.WriteString(chunk.Content)
-				content := fullResponse.String()
+				// Deanonymize the accumulated content for display
+				content := cv.app.anonymizer.Deanonymize(fullResponse.String())
 				fyne.Do(func() {
 					assistantRichText.ParseMarkdown(content)
 				})
 			}
 
 			if chunk.Done {
-				// Save new assistant message
+				// Deanonymize the final response before saving
+				finalResponse := cv.app.anonymizer.Deanonymize(fullResponse.String())
+				
+				// Save new assistant message (with original sensitive data restored)
 				_, err := cv.app.db.CreateMessage(
 					cv.conversationID,
 					"assistant",
-					fullResponse.String(),
+					finalResponse,
 					cv.currentProvider,
 					cv.currentProvider,
 					"",
@@ -1475,6 +1523,9 @@ func (cv *ChatView) regenerateMessage(messageIndex int) {
 				if err != nil {
 					cv.app.logger.Error("Failed to save assistant message: %v", err)
 				}
+				
+				// Clear anonymization mappings for next conversation turn
+				cv.app.anonymizer.Clear()
 				
 				// Auto-generate title if needed
 				utils.SafeGo(cv.app.logger, "autoGenerateTitle", cv.autoGenerateTitle)
