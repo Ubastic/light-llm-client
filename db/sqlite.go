@@ -66,6 +66,7 @@ func (db *DB) migrate() error {
 			conversation_id INTEGER NOT NULL,
 			role TEXT NOT NULL,
 			content TEXT NOT NULL,
+			original_content TEXT DEFAULT '',
 			provider TEXT DEFAULT '',
 			model TEXT DEFAULT '',
 			attachments TEXT DEFAULT '',
@@ -113,6 +114,33 @@ func (db *DB) migrate() error {
 		if _, err := db.conn.Exec(migration); err != nil {
 			return fmt.Errorf("migration failed: %w\nSQL: %s", err, migration)
 		}
+	}
+
+	// Run additional migrations for existing databases
+	if err := db.runAdditionalMigrations(); err != nil {
+		return fmt.Errorf("additional migration failed: %w", err)
+	}
+
+	return nil
+}
+
+// runAdditionalMigrations runs migrations for existing databases
+func (db *DB) runAdditionalMigrations() error {
+	// Check if original_content column exists
+	var columnExists bool
+	err := db.conn.QueryRow(`
+		SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'original_content'
+	`).Scan(&columnExists)
+	if err != nil {
+		return fmt.Errorf("failed to check if original_content column exists: %w", err)
+	}
+
+	// If column doesn't exist, add it
+	if !columnExists {
+		if _, err := db.conn.Exec(`ALTER TABLE messages ADD COLUMN original_content TEXT DEFAULT ''`); err != nil {
+			return fmt.Errorf("failed to add original_content column: %w", err)
+		}
+		fmt.Println("Added original_content column to messages table")
 	}
 
 	return nil

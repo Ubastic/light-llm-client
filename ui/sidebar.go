@@ -308,7 +308,7 @@ func (cs *ConversationSidebar) preloadVisibleConversations() {
 			
 			uiObjects := make([]fyne.CanvasObject, 0, len(messages)*4)
 			for j, msg := range messages {
-				messageBox := tempChatView.buildMessageUI(msg.Role, msg.Content, msg.Model, j)
+				messageBox := tempChatView.buildMessageUI(msg, j)
 				uiObjects = append(uiObjects, messageBox)
 			}
 			

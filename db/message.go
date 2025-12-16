@@ -8,8 +8,8 @@ import (
 // CreateMessage creates a new message in a conversation
 func (db *DB) CreateMessage(conversationID int64, role, content, provider, model, attachments string, tokensUsed int) (*Message, error) {
 	result, err := db.conn.Exec(
-		"INSERT INTO messages (conversation_id, role, content, provider, model, attachments, tokens_used, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-		conversationID, role, content, provider, model, attachments, tokensUsed, time.Now(),
+		"INSERT INTO messages (conversation_id, role, content, original_content, provider, model, attachments, tokens_used, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		conversationID, role, content, "", provider, model, attachments, tokensUsed, time.Now(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create message: %w", err)
@@ -30,6 +30,7 @@ func (db *DB) CreateMessage(conversationID int64, role, content, provider, model
 		ConversationID: conversationID,
 		Role:           role,
 		Content:        content,
+		OriginalContent: "",
 		Provider:       provider,
 		Model:          model,
 		Attachments:    attachments,
@@ -56,7 +57,7 @@ func (db *DB) GetMessage(id int64) (*Message, error) {
 // ListMessages retrieves all messages in a conversation
 func (db *DB) ListMessages(conversationID int64) ([]*Message, error) {
 	rows, err := db.conn.Query(
-		"SELECT id, conversation_id, role, content, provider, model, attachments, tokens_used, created_at FROM messages WHERE conversation_id = ? ORDER BY created_at ASC",
+		"SELECT id, conversation_id, role, content, original_content, provider, model, attachments, tokens_used, created_at FROM messages WHERE conversation_id = ? ORDER BY created_at ASC",
 		conversationID,
 	)
 	if err != nil {
@@ -67,13 +68,25 @@ func (db *DB) ListMessages(conversationID int64) ([]*Message, error) {
 	var messages []*Message
 	for rows.Next() {
 		var msg Message
-		if err := rows.Scan(&msg.ID, &msg.ConversationID, &msg.Role, &msg.Content, &msg.Provider, &msg.Model, &msg.Attachments, &msg.TokensUsed, &msg.CreatedAt); err != nil {
+		if err := rows.Scan(&msg.ID, &msg.ConversationID, &msg.Role, &msg.Content, &msg.OriginalContent, &msg.Provider, &msg.Model, &msg.Attachments, &msg.TokensUsed, &msg.CreatedAt); err != nil {
 			return nil, fmt.Errorf("failed to scan message: %w", err)
 		}
 		messages = append(messages, &msg)
 	}
 
 	return messages, nil
+}
+
+// UpdateMessageOriginalContent updates the original content of a message
+func (db *DB) UpdateMessageOriginalContent(messageID int64, originalContent string) error {
+	_, err := db.conn.Exec(
+		"UPDATE messages SET original_content = ? WHERE id = ?",
+		originalContent, messageID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update message original content: %w", err)
+	}
+	return nil
 }
 
 // UpdateMessage updates a message's content

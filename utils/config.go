@@ -214,6 +214,14 @@ func EnsureDefaultConfig() (string, error) {
 			Enabled: false,
 			URL:     "",
 		},
+		Privacy: PrivacyConfig{
+			AnonymizeSensitiveData: true,
+			AnonymizeURLs:          true,
+			AnonymizeAPIKeys:       true,
+			AnonymizeEmails:        true,
+			AnonymizeIPAddresses:   true,
+			AnonymizeFilePaths:     true,
+		},
 	}
 
 	if err := SaveConfig(configPath, defaultConfig); err != nil {

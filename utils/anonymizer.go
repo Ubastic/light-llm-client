@@ -16,8 +16,9 @@ type Anonymizer struct {
 	mu              sync.RWMutex
 	mapping         map[string]string // anonymized -> original
 	reverseMapping  map[string]string // original -> anonymized
-	enabled         bool
+	config          PrivacyConfig
 	patterns        []AnonymizationPattern
+	enabledPatterns map[string]bool
 }
 
 // AnonymizationPattern defines a pattern to detect and anonymize
@@ -29,11 +30,11 @@ type AnonymizationPattern struct {
 }
 
 // NewAnonymizer creates a new anonymizer with default patterns
-func NewAnonymizer(enabled bool) *Anonymizer {
+func NewAnonymizer(config PrivacyConfig) *Anonymizer {
 	a := &Anonymizer{
 		mapping:        make(map[string]string),
 		reverseMapping: make(map[string]string),
-		enabled:        enabled,
+		config:         config,
 	}
 	
 	// Initialize default patterns (ordered by priority)
@@ -186,7 +187,7 @@ func (a *Anonymizer) generatePlaceholder(template, value string) string {
 
 // Anonymize replaces sensitive information in the text
 func (a *Anonymizer) Anonymize(text string) string {
-	if !a.enabled || text == "" {
+	if !a.config.AnonymizeSensitiveData || text == "" {
 		return text
 	}
 	
@@ -203,6 +204,9 @@ func (a *Anonymizer) Anonymize(text string) string {
 	
 	// Step 3: Process regex patterns in priority order (highest first)
 	for _, pattern := range a.patterns {
+			if !a.isPatternEnabled(pattern) {
+				continue
+			}
 		matches := pattern.Regex.FindAllStringSubmatch(result, -1)
 		
 		for _, match := range matches {
@@ -237,7 +241,7 @@ func (a *Anonymizer) Anonymize(text string) string {
 
 // Deanonymize restores original sensitive information in the text
 func (a *Anonymizer) Deanonymize(text string) string {
-	if !a.enabled || text == "" {
+	if !a.config.AnonymizeSensitiveData || text == "" {
 		return text
 	}
 	
@@ -267,14 +271,14 @@ func (a *Anonymizer) Clear() {
 func (a *Anonymizer) SetEnabled(enabled bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.enabled = enabled
+	a.config.AnonymizeSensitiveData = enabled
 }
 
 // IsEnabled returns whether anonymization is enabled
 func (a *Anonymizer) IsEnabled() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.enabled
+	return a.config.AnonymizeSensitiveData
 }
 
 // GetMappingCount returns the number of anonymized values
@@ -605,6 +609,26 @@ func (a *Anonymizer) anonymizeValue(value, prefix string) string {
 }
 
 // isPlaceholder checks if a string looks like an anonymization placeholder
+// isPatternEnabled checks if a specific anonymization pattern is enabled by the config
+func (a *Anonymizer) isPatternEnabled(pattern AnonymizationPattern) bool {
+	switch pattern.Name {
+	case "URL with Auth", "URL":
+		return a.config.AnonymizeURLs
+	case "Bearer Token", "API Key", "JWT Token", "AWS Access Key", "AWS Secret Key", "Generic Secret":
+		return a.config.AnonymizeAPIKeys
+	case "Email":
+		return a.config.AnonymizeEmails
+	case "IPv4 Address", "IPv6 Address":
+		return a.config.AnonymizeIPAddresses
+	case "Windows Path", "Unix Path":
+		return a.config.AnonymizeFilePaths
+	default:
+		// For other general patterns like passwords, usernames, etc.,
+		// we can tie them to the main AnonymizeSensitiveData flag.
+		return a.config.AnonymizeSensitiveData
+	}
+}
+
 func (a *Anonymizer) isPlaceholder(value string) bool {
 	// Check if it's in our mapping
 	if _, exists := a.mapping[value]; exists {

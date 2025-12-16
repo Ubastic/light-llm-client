@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"light-llm-client/db"
 	"light-llm-client/llm"
 	"light-llm-client/utils"
 	"strings"
@@ -123,6 +124,12 @@ type ChatView struct {
 	sendButton       *widget.Button
 	providerSelect   *widget.Select
 	fileUploadArea   *FileUploadArea
+	messages         []db.Message // Store the actual messages for reference
+	// Track which messages are showing anonymized content (true = showing anonymized, false = showing original)
+	showAnonymized   map[int]bool
+	// Cache for messages and UI components to prevent flickering
+	messageCache     []db.Message
+	uiCache          []fyne.CanvasObject
 }
 
 // streamChatWithRetry attempts to stream chat with retry logic
@@ -195,6 +202,9 @@ func NewChatView(app *App) *ChatView {
 		app:             app,
 		conversationID:  0,
 		currentProvider: "",
+		showAnonymized:  make(map[int]bool),
+		messageCache:    make([]db.Message, 0),
+		uiCache:         make([]fyne.CanvasObject, 0),
 	}
 
 	return cv
@@ -307,6 +317,8 @@ func (cv *ChatView) loadMessages() {
 			cv.messagesContainer.Objects = []fyne.CanvasObject{}
 			cv.messagesContainer.Refresh()
 		})
+		cv.messages = nil // Clear messages when no conversation
+		cv.showAnonymized = make(map[int]bool) // Clear showAnonymized map
 		return
 	}
 
@@ -337,6 +349,16 @@ func (cv *ChatView) loadMessages() {
 			cv.messagesContainer.Objects = cachedUI
 			cv.messagesContainer.Refresh()
 		}
+		
+		// Update messages field from cached data
+		if cachedMessages, cached := cv.app.messageCache[cv.conversationID]; cached {
+			cv.messages = make([]db.Message, len(cachedMessages))
+			for i, msg := range cachedMessages {
+				cv.messages[i] = *msg
+			}
+			// Synchronize showAnonymized map with message indices
+			cv.syncShowAnonymizedMap()
+		}
 		return
 	}
 	
@@ -344,11 +366,20 @@ func (cv *ChatView) loadMessages() {
 	if cachedMessages, cached := cv.app.messageCache[cv.conversationID]; cached {
 		cv.app.updateCacheAccess(cv.conversationID) // Update LRU
 		cv.app.logger.Info("Using cached messages for conversation %d", cv.conversationID)
+		
+		// Update messages field from cache
+		cv.messages = make([]db.Message, len(cachedMessages))
+		for i, msg := range cachedMessages {
+			cv.messages[i] = *msg
+		}
+		// Synchronize showAnonymized map with message indices
+		cv.syncShowAnonymizedMap()
+		
 		// Build UI from cached messages in background
 		utils.SafeGo(cv.app.logger, "loadMessages-cached", func() {
 			uiObjects := make([]fyne.CanvasObject, 0, len(cachedMessages)*4)
 			for i, msg := range cachedMessages {
-				messageBox := cv.buildMessageUI(msg.Role, msg.Content, msg.Model, i)
+				messageBox := cv.buildMessageUI(msg, i)
 				uiObjects = append(uiObjects, messageBox)
 			}
 			
@@ -363,13 +394,16 @@ func (cv *ChatView) loadMessages() {
 		return
 	}
 
-	// Immediately clear and show loading indicator
-	loadingLabel := widget.NewLabel("📖 加载消息中...")
-	loadingLabel.TextStyle = fyne.TextStyle{Italic: true}
-	fyne.Do(func() {
-		cv.messagesContainer.Objects = []fyne.CanvasObject{loadingLabel}
-		cv.messagesContainer.Refresh()
-	})
+	// Keep current UI visible while loading new messages
+	// Only show loading indicator if there are no current messages
+	if len(cv.messagesContainer.Objects) == 0 {
+		loadingLabel := widget.NewLabel("📖 加载消息中...")
+		loadingLabel.TextStyle = fyne.TextStyle{Italic: true}
+		fyne.Do(func() {
+			cv.messagesContainer.Objects = []fyne.CanvasObject{loadingLabel}
+			cv.messagesContainer.Refresh()
+		})
+	}
 
 	// Load messages asynchronously to avoid blocking UI
 	utils.SafeGo(cv.app.logger, "loadMessages", func() {
@@ -389,10 +423,19 @@ func (cv *ChatView) loadMessages() {
 		cv.app.messageCache[cv.conversationID] = messages
 		cv.app.updateCacheAccess(cv.conversationID) // Update LRU
 
+		// Update messages field
+		cv.messages = make([]db.Message, len(messages))
+		for i, msg := range messages {
+			cv.messages[i] = *msg
+		}
+		
+		// Synchronize showAnonymized map with message indices
+		cv.syncShowAnonymizedMap()
+
 		// Build all UI objects in background
 		uiObjects := make([]fyne.CanvasObject, 0, len(messages)*4) // Pre-allocate capacity
 		for i, msg := range messages {
-			messageBox := cv.buildMessageUI(msg.Role, msg.Content, msg.Model, i)
+			messageBox := cv.buildMessageUI(msg, i)
 			uiObjects = append(uiObjects, messageBox)
 		}
 		
@@ -407,10 +450,110 @@ func (cv *ChatView) loadMessages() {
 	})
 }
 
-// sendMessage sends the current message
+// sendMessage handles the user's request to send a message.
+// It checks for anonymization and shows a confirmation dialog if needed.
 func (cv *ChatView) sendMessage() {
 	content := strings.TrimSpace(cv.inputEntry.Text)
 	attachments := cv.fileUploadArea.GetAttachments()
+
+	if content == "" && len(attachments) == 0 {
+		return
+	}
+
+	// Combine user message with text file contents
+	fullContent := content
+	if len(attachments) > 0 {
+		var textFileContents []string
+		for _, att := range attachments {
+			if att.Type == "file" {
+				fileContent := utils.GetTextContent(att)
+				textFileContents = append(textFileContents, fmt.Sprintf("\n\n--- 文件: %s ---\n%s\n--- 文件结束 ---\n", att.Filename, fileContent))
+			}
+		}
+		if len(textFileContents) > 0 {
+			fullContent += strings.Join(textFileContents, "")
+		}
+	}
+
+	// If anonymization is enabled, show confirmation dialog
+	if cv.app.anonymizer.IsEnabled() {
+		anonymizedContent := cv.app.anonymizer.Anonymize(fullContent)
+
+		// If content is unchanged, proceed without confirmation
+		if anonymizedContent == fullContent {
+			cv.proceedWithMessage(fullContent, attachments)
+			return
+		}
+
+		cv.showAnonymizationConfirmation(fullContent, anonymizedContent, attachments)
+	} else {
+		// Otherwise, send the original message directly
+		cv.proceedWithMessage(fullContent, attachments)
+	}
+}
+
+// showAnonymizationConfirmation shows a dialog for the user to confirm the anonymized message
+func (cv *ChatView) showAnonymizationConfirmation(originalContent, anonymizedContent string, attachments []*llm.Attachment) {
+	originalLabel := widget.NewLabel(originalContent)
+	originalLabel.Wrapping = fyne.TextWrapWord
+
+	anonymizedLabel := widget.NewLabel(anonymizedContent)
+	anonymizedLabel.Wrapping = fyne.TextWrapWord
+
+	var popup *widget.PopUp
+
+	cancelButton := widget.NewButton("取消", func() {
+		cv.app.anonymizer.Clear()
+		if popup != nil {
+			popup.Hide()
+		}
+	})
+
+	confirmButton := widget.NewButton("确认发送", func() {
+		cv.proceedWithMessage(anonymizedContent, attachments)
+		if popup != nil {
+			popup.Hide()
+		}
+	})
+
+	originalScroll := container.NewScroll(originalLabel)
+	anonymizedScroll := container.NewScroll(anonymizedLabel)
+
+	// Use a VSplit to allow the two message areas to share the space and expand
+	messageSplit := container.NewVSplit(originalScroll, anonymizedScroll)
+	messageSplit.Offset = 0.5 // Split them evenly
+
+	dialogContent := container.NewBorder(
+		// Top: Title and first label
+		container.NewVBox(
+			widget.NewLabel("匿名化预览"),
+			widget.NewSeparator(),
+			widget.NewLabel("原始消息:"),
+		),
+		// Bottom: Second label and buttons
+		container.NewVBox(
+			widget.NewSeparator(),
+			widget.NewLabel("匿名化后消息:"),
+			container.NewHBox(cancelButton, confirmButton),
+		),
+		nil, // Left
+		nil, // Right
+		messageSplit, // Center (will expand)
+	)
+
+	// Create the modal dialog
+	popup = widget.NewModalPopUp(dialogContent, cv.app.window.Canvas())
+
+	// Set a minimum size for the dialog by resizing it
+	popup.Resize(fyne.NewSize(600, 500))
+
+	popup.Show()
+}
+
+// proceedWithMessage contains the core logic to save and send a message
+// content parameter can be either original content (when anonymization is disabled) 
+// or anonymized content (when anonymization is enabled)
+func (cv *ChatView) proceedWithMessage(content string, attachments []*llm.Attachment) {
 	
 	if content == "" && len(attachments) == 0 {
 		return
@@ -443,11 +586,6 @@ func (cv *ChatView) sendMessage() {
 		}
 	}
 	
-	// Combine user message with text file contents
-	fullContent := content
-	if len(textFileContents) > 0 {
-		fullContent = content + strings.Join(textFileContents, "")
-	}
 	
 	// Serialize all attachments to JSON for database storage
 	attachmentsJSON := ""
@@ -460,20 +598,47 @@ func (cv *ChatView) sendMessage() {
 		}
 	}
 
-	// Save user message with attachments (save original content + attachments JSON)
-	_, err := cv.app.db.CreateMessage(cv.conversationID, "user", fullContent, "", "", attachmentsJSON, 0)
-	if err != nil {
-		cv.app.logger.Error("Failed to save user message: %v", err)
-		cv.app.showError("Failed to save user message: " + err.Error())
-		return
-	}
+	// Save user message with attachments
+	// If anonymization is enabled and we have original content stored, save both
+	var message *db.Message
+	var err error
 	
-	// Invalidate cache since we added a new message
-	delete(cv.app.messageCache, cv.conversationID)
-	delete(cv.app.uiCache, cv.conversationID)
-
-	// Add to UI (use -1 for new messages that aren't in the list yet)
-	cv.addMessageToUI("user", fullContent, "", -1)
+	if cv.app.anonymizer.IsEnabled() && cv.app.anonymizer.GetMappingCount() > 0 {
+		// Anonymization is enabled - we need to store both original and anonymized content
+		// Get the original content from the anonymizer's reverse mapping
+		originalContent := cv.app.anonymizer.Deanonymize(content)
+		
+		// Create message with anonymized content as main content
+		message, err = cv.app.db.CreateMessage(cv.conversationID, "user", content, "", "", attachmentsJSON, 0)
+		if err != nil {
+			cv.app.logger.Error("Failed to save user message: %v", err)
+			cv.app.showError("Failed to save user message: " + err.Error())
+			return
+		}
+		
+		// Update the message with original content
+		if err := cv.app.db.UpdateMessageOriginalContent(message.ID, originalContent); err != nil {
+			cv.app.logger.Error("Failed to update message original content: %v", err)
+		}
+		
+		// Display the original content in UI
+		cv.addMessageToUI("user", originalContent, "", -1)
+		// Update cache immediately after user message
+		cv.updateCacheAfterNewMessage(*message)
+	} else {
+		// No anonymization - save and display content as-is
+		message, err = cv.app.db.CreateMessage(cv.conversationID, "user", content, "", "", attachmentsJSON, 0)
+		if err != nil {
+			cv.app.logger.Error("Failed to save user message: %v", err)
+			cv.app.showError("Failed to save user message: " + err.Error())
+			return
+		}
+		
+		// Display the content in UI
+		cv.addMessageToUI("user", content, "", -1)
+		// Update cache immediately after user message
+		cv.updateCacheAfterNewMessage(*message)
+	}
 	cv.inputEntry.SetText("")
 	
 	// Clear attachments after sending
@@ -512,22 +677,15 @@ func (cv *ChatView) sendMessage() {
 			}
 		}
 		
-		// Anonymize message content before sending to LLM
-		anonymizedContent := cv.app.anonymizer.Anonymize(msg.Content)
+		// Anonymization is now handled before calling proceedWithMessage
+		// We send the already-anonymized content to the LLM
+		anonymizedContent := msg.Content
 		
 		llmMessages = append(llmMessages, llm.Message{
 			Role:        msg.Role,
 			Content:     anonymizedContent,
 			Attachments: imageAttachments,
 		})
-	}
-	
-	// Log anonymization stats if enabled
-	if cv.app.anonymizer.IsEnabled() {
-		mappingCount := cv.app.anonymizer.GetMappingCount()
-		if mappingCount > 0 {
-			cv.app.logger.Info("Anonymized %d sensitive values before sending to LLM", mappingCount)
-		}
 	}
 
 	// Create placeholder for assistant response with RichText
@@ -562,7 +720,7 @@ func (cv *ChatView) sendMessage() {
 				assistantRichText.ParseMarkdown(errorMsg)
 			})
 			// Save error message so it can be retried
-			_, saveErr := cv.app.db.CreateMessage(
+			errorMsgObj, saveErr := cv.app.db.CreateMessage(
 				cv.conversationID,
 				"assistant",
 				errorMsg,
@@ -573,6 +731,9 @@ func (cv *ChatView) sendMessage() {
 			)
 			if saveErr != nil {
 				cv.app.logger.Error("Failed to save error message: %v", saveErr)
+			} else {
+				// Add the error message to cv.messages array
+				cv.addMessageToMessagesArray(*errorMsgObj)
 			}
 			// Clear anonymization mappings
 			cv.app.anonymizer.Clear()
@@ -592,7 +753,7 @@ func (cv *ChatView) sendMessage() {
 					assistantRichText.ParseMarkdown(errorMsg)
 				})
 				// Save error message so it can be retried
-				_, saveErr := cv.app.db.CreateMessage(
+				errorMsgObj, saveErr := cv.app.db.CreateMessage(
 					cv.conversationID,
 					"assistant",
 					errorMsg,
@@ -603,6 +764,9 @@ func (cv *ChatView) sendMessage() {
 				)
 				if saveErr != nil {
 					cv.app.logger.Error("Failed to save error message: %v", saveErr)
+				} else {
+					// Add the error message to cv.messages array
+					cv.addMessageToMessagesArray(*errorMsgObj)
 				}
 				// Clear anonymization mappings
 				cv.app.anonymizer.Clear()
@@ -623,35 +787,63 @@ func (cv *ChatView) sendMessage() {
 			}
 
 			if chunk.Done {
-				// Deanonymize the final response before saving
-				finalResponse := cv.app.anonymizer.Deanonymize(fullResponse.String())
-				
-				// Save assistant message (with original sensitive data restored)
-				_, err := cv.app.db.CreateMessage(
-					cv.conversationID,
-					"assistant",
-					finalResponse,
-					cv.currentProvider,
-					cv.currentProvider,
-					"",
-					0,
-				)
-				if err != nil {
-					cv.app.logger.Error("Failed to save assistant message: %v", err)
-				}
-				
-				// Clear anonymization mappings for next conversation turn
-				cv.app.anonymizer.Clear()
-				
-				// Auto-generate title if this is the first exchange
-				utils.SafeGo(cv.app.logger, "autoGenerateTitle", cv.autoGenerateTitle)
-				
-				// Reload messages to show the new one with proper action buttons
-				cv.loadMessages()
-				break
-			}
-		}
-	})
+    // Deanonymize the final response before saving
+    finalResponse := cv.app.anonymizer.Deanonymize(fullResponse.String())
+    
+    // Save assistant message (with original sensitive data restored)
+    assistantMsg, err := cv.app.db.CreateMessage(
+        cv.conversationID,
+        "assistant",
+        finalResponse,
+        cv.currentProvider,
+        cv.currentProvider,
+        "",
+        0,
+    )
+    if err != nil {
+        cv.app.logger.Error("Failed to save assistant message: %v", err)
+    } else {
+        // Add the assistant message to cv.messages array
+        cv.addMessageToMessagesArray(*assistantMsg)
+        
+        // Update cache immediately with the new message
+        cv.updateCacheAfterNewMessage(*assistantMsg)
+        
+        // 【关键修改】：不要调用 loadMessages()，而是直接更新当前消息的UI
+        // 将临时的流式显示替换为完整的带按钮的消息UI
+        fyne.Do(func() {
+            // 获取最后一个消息的索引
+            lastIndex := len(cv.messagesContainer.Objects) - 1
+            if lastIndex >= 0 {
+                // 创建完整的消息UI（包含所有按钮）
+                messageIndex := len(cv.messages) - 1
+                completeMessageUI := cv.buildMessageUI(assistantMsg, messageIndex)
+                
+                // 替换临时UI
+                cv.messagesContainer.Objects[lastIndex] = completeMessageUI
+                cv.messagesContainer.Refresh()
+                
+                // 更新UI缓存
+                if cv.app.uiCache != nil {
+                    cv.app.uiCache[cv.conversationID] = append([]fyne.CanvasObject{}, cv.messagesContainer.Objects...)
+                }
+            }
+        })
+    }
+    
+    // Clear anonymization mappings for next conversation turn
+    cv.app.anonymizer.Clear()
+    
+    // Auto-generate title if this is the first exchange
+    utils.SafeGo(cv.app.logger, "autoGenerateTitle", cv.autoGenerateTitle)
+    
+    // 【删除这一行】：不要重新加载消息
+    // cv.loadMessages()
+    
+    break
+}
+	}
+})
 }
 
 // autoGenerateTitle automatically generates a title for the conversation
@@ -732,14 +924,14 @@ func (cv *ChatView) autoGenerateTitle() {
 
 // buildMessageUI builds a message UI component without adding it to the container
 // This is used for batch loading messages
-func (cv *ChatView) buildMessageUI(role, content, model string, messageIndex int) fyne.CanvasObject {
+func (cv *ChatView) buildMessageUI(msg *db.Message, messageIndex int) fyne.CanvasObject {
 	var roleLabel string
-	if role == "user" {
+	if msg.Role == "user" {
 		roleLabel = "👤 用户"
 	} else {
 		roleLabel = "🤖 助手"
-		if model != "" {
-			roleLabel += fmt.Sprintf(" (%s)", model)
+		if msg.Model != "" {
+			roleLabel += fmt.Sprintf(" (%s)", msg.Model)
 		}
 	}
 
@@ -747,22 +939,50 @@ func (cv *ChatView) buildMessageUI(role, content, model string, messageIndex int
 	roleWidget := widget.NewLabel(roleLabel)
 	roleWidget.TextStyle = fyne.TextStyle{Bold: true}
 	
+	// Check if this message has been anonymized (has original content different from current content)
+	hasAnonymizedContent := msg.OriginalContent != "" && msg.OriginalContent != msg.Content
+	
+	// Create role container that will hold the role label and any indicators
+	var roleContainer fyne.CanvasObject = roleWidget
+	
+	// Add anonymization indicator if message has been anonymized
+	if hasAnonymizedContent {
+		// Add subtle indicator that this message has been anonymized
+		anonymizedLabel := widget.NewLabel("🔒 已匿名化")
+		anonymizedLabel.TextStyle = fyne.TextStyle{Italic: true}
+		
+		// Create a container with role label and anonymization indicator
+		roleContainer = container.NewHBox(roleWidget, anonymizedLabel)
+	}
+	
+	// Determine which content to display based on user preference
+	displayContent := msg.Content
+	if msg.OriginalContent != "" {
+		// If user has toggled to show anonymized content, use the current content
+		// Otherwise, prefer to show the original content
+		if messageIndex >= 0 && messageIndex < len(cv.messages) && cv.showAnonymized[messageIndex] {
+			displayContent = msg.Content
+		} else {
+			displayContent = msg.OriginalContent
+		}
+	}
+	
 	var contentWidget fyne.CanvasObject
-	if role == "assistant" {
+	if msg.Role == "assistant" {
 		// Assistant messages: parse and render with code block copy buttons
-		contentWidget = cv.renderAssistantMessage(content)
+		contentWidget = cv.renderAssistantMessage(displayContent)
 	} else {
 		// User messages use selectable text
-		contentWidget = newSelectableText(content)
+		contentWidget = newSelectableText(displayContent)
 	}
 
 	// Create action buttons
 	var actionButtons *fyne.Container
-	if role == "assistant" {
+	if msg.Role == "assistant" {
 		// For assistant messages, provide copy, edit and regenerate options
 		copyTextButton := widget.NewButton("📋 复制文本", func() {
 			// Convert markdown to plain text (simple conversion)
-			plainText := cv.markdownToPlainText(content)
+			plainText := cv.markdownToPlainText(displayContent)
 			cv.app.window.Clipboard().SetContent(plainText)
 			cv.app.logger.Info("Message text copied to clipboard")
 		})
@@ -770,7 +990,7 @@ func (cv *ChatView) buildMessageUI(role, content, model string, messageIndex int
 		
 		copyMarkdownButton := widget.NewButton("📄 复制 Markdown", func() {
 			// Copy original markdown content
-			cv.app.window.Clipboard().SetContent(content)
+			cv.app.window.Clipboard().SetContent(displayContent)
 			cv.app.logger.Info("Message markdown copied to clipboard")
 		})
 		copyMarkdownButton.Importance = widget.LowImportance
@@ -779,7 +999,7 @@ func (cv *ChatView) buildMessageUI(role, content, model string, messageIndex int
 		idx := messageIndex
 		
 		editButton := widget.NewButton("✏️ 编辑", func() {
-			cv.editMessage(idx, content)
+			cv.editMessage(idx, displayContent)
 		})
 		editButton.Importance = widget.LowImportance
 		
@@ -792,7 +1012,7 @@ func (cv *ChatView) buildMessageUI(role, content, model string, messageIndex int
 	} else {
 		// For user messages, add copy, edit, and delete buttons
 		copyButton := widget.NewButton("📋 复制", func() {
-			cv.app.window.Clipboard().SetContent(content)
+			cv.app.window.Clipboard().SetContent(displayContent)
 			cv.app.logger.Info("Message copied to clipboard")
 		})
 		copyButton.Importance = widget.LowImportance
@@ -800,7 +1020,7 @@ func (cv *ChatView) buildMessageUI(role, content, model string, messageIndex int
 		// Capture messageIndex in closure
 		idx := messageIndex
 		editButton := widget.NewButton("✏️ 编辑", func() {
-			cv.editMessage(idx, content)
+			cv.editMessage(idx, displayContent)
 		})
 		editButton.Importance = widget.LowImportance
 		
@@ -811,9 +1031,30 @@ func (cv *ChatView) buildMessageUI(role, content, model string, messageIndex int
 		
 		actionButtons = container.NewHBox(copyButton, editButton, deleteButton)
 	}
+	
+	// Add anonymization toggle button if message has both original and anonymized content
+	if hasAnonymizedContent {
+		// Determine button text based on current state
+		buttonText := "👁️ 显示匿名化内容"
+		if messageIndex >= 0 && messageIndex < len(cv.messages) && cv.showAnonymized[messageIndex] {
+			buttonText = "👁️ 显示原始内容"
+		}
+		
+		// Create toggle button for switching between original and anonymized content
+		toggleButton := widget.NewButton(buttonText, func() {
+			// Toggle between original and anonymized content
+			cv.toggleMessageContent(messageIndex)
+		})
+		toggleButton.Importance = widget.LowImportance
+		
+		// Add the toggle button to the action buttons
+		if actionButtons != nil {
+			actionButtons.Objects = append(actionButtons.Objects, toggleButton)
+		}
+	}
 
 	messageBox := container.NewVBox(
-		roleWidget,
+		roleContainer,
 		container.NewPadded(contentWidget),
 		actionButtons,
 		widget.NewSeparator(),
@@ -822,10 +1063,87 @@ func (cv *ChatView) buildMessageUI(role, content, model string, messageIndex int
 	return messageBox
 }
 
+// addMessageToMessagesArray safely adds a message to the messages array and initializes showAnonymized
+func (cv *ChatView) addMessageToMessagesArray(msg db.Message) {
+	cv.messages = append(cv.messages, msg)
+	// Initialize showAnonymized for the new message
+	cv.showAnonymized[len(cv.messages)-1] = false
+}
+
+// syncShowAnonymizedMap synchronizes the showAnonymized map with the current messages array
+func (cv *ChatView) syncShowAnonymizedMap() {
+	// Create a new map with the correct size
+	newMap := make(map[int]bool)
+	
+	// Copy existing preferences for messages that still exist
+	for i := 0; i < len(cv.messages); i++ {
+		if val, exists := cv.showAnonymized[i]; exists {
+			newMap[i] = val
+		} else {
+			// Default to showing original content (false)
+			newMap[i] = false
+		}
+	}
+	
+	cv.showAnonymized = newMap
+}
+
+// toggleMessageContent switches between original and anonymized content for a message
+func (cv *ChatView) toggleMessageContent(messageIndex int) {
+	if messageIndex < 0 || messageIndex >= len(cv.messages) {
+		return
+	}
+	
+	msg := cv.messages[messageIndex]
+	if msg.OriginalContent == "" || msg.OriginalContent == msg.Content {
+		return // No anonymized content to toggle
+	}
+	
+	// Toggle the display preference for this message
+	cv.showAnonymized[messageIndex] = !cv.showAnonymized[messageIndex]
+	
+	// Reload the message to reflect the new state
+	cv.reloadMessage(messageIndex)
+}
+
+// reloadMessage reloads a specific message in the UI
+func (cv *ChatView) reloadMessage(messageIndex int) {
+	if messageIndex < 0 || messageIndex >= len(cv.messages) {
+		return
+	}
+	
+	// Get the message to reload
+	msg := cv.messages[messageIndex]
+	
+	// Create new message UI
+	newMessageUI := cv.buildMessageUI(&msg, messageIndex)
+	
+	// Replace the old message UI with the new one
+	fyne.Do(func() {
+		// Remove the old message
+		cv.messagesContainer.Objects[messageIndex] = newMessageUI
+		cv.messagesContainer.Refresh()
+	})
+}
+
 // addMessageToUI adds a message to the UI
 // messageIndex is the index in the messages list, or -1 for new messages
 func (cv *ChatView) addMessageToUI(role, content, model string, messageIndex int) {
-	messageBox := cv.buildMessageUI(role, content, model, messageIndex)
+	// Create a temporary message object for the new message
+	msg := &db.Message{
+		Role:    role,
+		Content: content,
+		Model:   model,
+		// OriginalContent will be empty for new messages
+	}
+	
+	// If this is a new message (messageIndex == -1), add it to cv.messages array
+	if messageIndex == -1 {
+		cv.addMessageToMessagesArray(*msg)
+		messageIndex = len(cv.messages) - 1
+	}
+	
+	messageBox := cv.buildMessageUI(msg, messageIndex)
 	fyne.Do(func() {
 		cv.messagesContainer.Add(messageBox)
 		cv.messagesContainer.Refresh()
@@ -1507,33 +1825,64 @@ func (cv *ChatView) regenerateMessage(messageIndex int) {
 			}
 
 			if chunk.Done {
-				// Deanonymize the final response before saving
-				finalResponse := cv.app.anonymizer.Deanonymize(fullResponse.String())
-				
-				// Save new assistant message (with original sensitive data restored)
-				_, err := cv.app.db.CreateMessage(
-					cv.conversationID,
-					"assistant",
-					finalResponse,
-					cv.currentProvider,
-					cv.currentProvider,
-					"",
-					0,
-				)
-				if err != nil {
-					cv.app.logger.Error("Failed to save assistant message: %v", err)
-				}
-				
-				// Clear anonymization mappings for next conversation turn
-				cv.app.anonymizer.Clear()
-				
-				// Auto-generate title if needed
-				utils.SafeGo(cv.app.logger, "autoGenerateTitle", cv.autoGenerateTitle)
-				
-				// Reload messages to show the new one with action buttons
-				cv.loadMessages()
-				break
-			}
+    // Deanonymize the final response before saving
+    finalResponse := cv.app.anonymizer.Deanonymize(fullResponse.String())
+    
+    // Save new assistant message (with original sensitive data restored)
+    assistantMsg, err := cv.app.db.CreateMessage(
+        cv.conversationID,
+        "assistant",
+        finalResponse,
+        cv.currentProvider,
+        cv.currentProvider,
+        "",
+        0,
+    )
+    if err != nil {
+        cv.app.logger.Error("Failed to save assistant message: %v", err)
+    } else {
+        // 【关键修改】：直接更新UI而不是重新加载
+        fyne.Do(func() {
+            // 获取最后一个消息的索引
+            lastIndex := len(cv.messagesContainer.Objects) - 1
+            if lastIndex >= 0 {
+                // 重新加载消息数组以获取最新数据
+                dbMessages, err := cv.app.db.ListMessages(cv.conversationID)
+                if err == nil {
+                    cv.messages = make([]db.Message, len(dbMessages))
+                    for i, msg := range dbMessages {
+                        cv.messages[i] = *msg
+                    }
+                    cv.syncShowAnonymizedMap()
+                    
+                    // 创建完整的消息UI（包含所有按钮）
+                    messageIndex := len(cv.messages) - 1
+                    completeMessageUI := cv.buildMessageUI(assistantMsg, messageIndex)
+                    
+                    // 替换临时UI
+                    cv.messagesContainer.Objects[lastIndex] = completeMessageUI
+                    cv.messagesContainer.Refresh()
+                    
+                    // 更新缓存
+                    cv.app.messageCache[cv.conversationID] = dbMessages
+                    cv.app.uiCache[cv.conversationID] = append([]fyne.CanvasObject{}, cv.messagesContainer.Objects...)
+                    cv.app.updateCacheAccess(cv.conversationID)
+                }
+            }
+        })
+    }
+    
+    // Clear anonymization mappings for next conversation turn
+    cv.app.anonymizer.Clear()
+    
+    // Auto-generate title if needed
+    utils.SafeGo(cv.app.logger, "autoGenerateTitle", cv.autoGenerateTitle)
+    
+    // 【删除这一行】：不要重新加载消息
+    // cv.loadMessages()
+    
+    break
+}
 		}
 	})
 }
@@ -1721,4 +2070,25 @@ func (cv *ChatView) deleteMessage(messageIndex int) {
 		cv.app.window.Canvas(),
 	)
 	dialog.Show()
+}
+
+// updateCacheAfterNewMessage updates the cache immediately after a new message is added
+func (cv *ChatView) updateCacheAfterNewMessage(newMessage db.Message) {
+    if cv.conversationID == 0 {
+        return
+    }
+    
+    cv.app.logger.Debug("Updating cache after new message")
+    
+    // Update message cache
+    if cachedMessages, exists := cv.app.messageCache[cv.conversationID]; exists {
+        // Add to existing cache
+        cv.app.messageCache[cv.conversationID] = append(cachedMessages, &newMessage)
+    } else {
+        // Create new cache
+        cv.app.messageCache[cv.conversationID] = []*db.Message{&newMessage}
+    }
+    
+    cv.app.updateCacheAccess(cv.conversationID)
+    cv.app.logger.Debug("Message cache updated")
 }

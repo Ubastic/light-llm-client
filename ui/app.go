@@ -67,7 +67,7 @@ func NewApp(config *utils.Config, configPath string, database *db.DB, logger *ut
 		db:         database,
 		logger:     logger,
 		providers:  make(map[string]llm.Provider),
-		anonymizer: utils.NewAnonymizer(config.Privacy.AnonymizeSensitiveData),
+		anonymizer: utils.NewAnonymizer(config.Privacy),
 		chatViews:  make(map[int64]*ChatView),
 		tabItems:   make(map[int64]*CustomTab),
 		messageCache: make(map[int64][]*db.Message),

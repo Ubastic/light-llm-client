@@ -12,7 +12,7 @@ type SearchResult struct {
 // SearchMessages performs full-text search on messages
 func (db *DB) SearchMessages(query string, limit int) ([]*SearchResult, error) {
 	rows, err := db.conn.Query(`
-		SELECT m.id, m.conversation_id, m.role, m.content, m.provider, m.model, m.attachments, m.tokens_used, m.created_at,
+		SELECT m.id, m.conversation_id, m.role, m.content, m.original_content, m.provider, m.model, m.attachments, m.tokens_used, m.created_at,
 		       snippet(messages_fts, 0, '<mark>', '</mark>', '...', 32) as snippet
 		FROM messages_fts
 		JOIN messages m ON messages_fts.rowid = m.id
@@ -29,7 +29,7 @@ func (db *DB) SearchMessages(query string, limit int) ([]*SearchResult, error) {
 	for rows.Next() {
 		var msg Message
 		var snippet string
-		if err := rows.Scan(&msg.ID, &msg.ConversationID, &msg.Role, &msg.Content, &msg.Provider, &msg.Model, &msg.Attachments, &msg.TokensUsed, &msg.CreatedAt, &snippet); err != nil {
+		if err := rows.Scan(&msg.ID, &msg.ConversationID, &msg.Role, &msg.Content, &msg.OriginalContent, &msg.Provider, &msg.Model, &msg.Attachments, &msg.TokensUsed, &msg.CreatedAt, &snippet); err != nil {
 			return nil, fmt.Errorf("failed to scan search result: %w", err)
 		}
 		results = append(results, &SearchResult{
@@ -46,7 +46,7 @@ func (db *DB) SearchMessages(query string, limit int) ([]*SearchResult, error) {
 func (db *DB) SearchMessagesWithFilters(query string, provider string, category string, daysAgo int, limit int) ([]*SearchResult, error) {
 	// Build query with filters
 	sqlQuery := `
-		SELECT m.id, m.conversation_id, m.role, m.content, m.provider, m.model, m.attachments, m.tokens_used, m.created_at,
+		SELECT m.id, m.conversation_id, m.role, m.content, m.original_content, m.provider, m.model, m.attachments, m.tokens_used, m.created_at,
 		       snippet(messages_fts, 0, '<mark>', '</mark>', '...', 32) as snippet
 		FROM messages_fts
 		JOIN messages m ON messages_fts.rowid = m.id
@@ -86,7 +86,7 @@ func (db *DB) SearchMessagesWithFilters(query string, provider string, category 
 	for rows.Next() {
 		var msg Message
 		var snippet string
-		if err := rows.Scan(&msg.ID, &msg.ConversationID, &msg.Role, &msg.Content, &msg.Provider, &msg.Model, &msg.Attachments, &msg.TokensUsed, &msg.CreatedAt, &snippet); err != nil {
+		if err := rows.Scan(&msg.ID, &msg.ConversationID, &msg.Role, &msg.Content, &msg.OriginalContent, &msg.Provider, &msg.Model, &msg.Attachments, &msg.TokensUsed, &msg.CreatedAt, &snippet); err != nil {
 			return nil, fmt.Errorf("failed to scan search result: %w", err)
 		}
 		results = append(results, &SearchResult{

@@ -846,11 +846,61 @@ func (sv *SettingsView) buildDataSettings() *fyne.Container {
 		sv.updateDBStats(statsLabel)
 	})
 	
+	// Anonymization settings
+	anonymizeCheck := widget.NewCheck("启用匿名化", func(checked bool) {
+		sv.app.config.Privacy.AnonymizeSensitiveData = checked
+		sv.savePrivacyConfig()
+	})
+	anonymizeCheck.Checked = sv.app.config.Privacy.AnonymizeSensitiveData
+
+	anonymizeURLsCheck := widget.NewCheck("匿名化 URLs", func(checked bool) {
+		sv.app.config.Privacy.AnonymizeURLs = checked
+		sv.savePrivacyConfig()
+	})
+	anonymizeURLsCheck.Checked = sv.app.config.Privacy.AnonymizeURLs
+
+	anonymizeAPIKeysCheck := widget.NewCheck("匿名化 API Keys", func(checked bool) {
+		sv.app.config.Privacy.AnonymizeAPIKeys = checked
+		sv.savePrivacyConfig()
+	})
+	anonymizeAPIKeysCheck.Checked = sv.app.config.Privacy.AnonymizeAPIKeys
+
+	anonymizeEmailsCheck := widget.NewCheck("匿名化 Emails", func(checked bool) {
+		sv.app.config.Privacy.AnonymizeEmails = checked
+		sv.savePrivacyConfig()
+	})
+	anonymizeEmailsCheck.Checked = sv.app.config.Privacy.AnonymizeEmails
+
+	anonymizeIPsCheck := widget.NewCheck("匿名化 IP 地址", func(checked bool) {
+		sv.app.config.Privacy.AnonymizeIPAddresses = checked
+		sv.savePrivacyConfig()
+	})
+	anonymizeIPsCheck.Checked = sv.app.config.Privacy.AnonymizeIPAddresses
+
+	anonymizeFilePathsCheck := widget.NewCheck("匿名化文件路径", func(checked bool) {
+		sv.app.config.Privacy.AnonymizeFilePaths = checked
+		sv.savePrivacyConfig()
+	})
+	anonymizeFilePathsCheck.Checked = sv.app.config.Privacy.AnonymizeFilePaths
+
+	anonymizationContainer := container.NewVBox(
+		widget.NewLabel("匿名化设置"),
+		widget.NewSeparator(),
+		anonymizeCheck,
+		container.NewGridWithColumns(2,
+			anonymizeURLsCheck,
+			anonymizeAPIKeysCheck,
+			anonymizeEmailsCheck,
+			anonymizeIPsCheck,
+			anonymizeFilePathsCheck,
+		),
+	)
+
 	form := widget.NewForm(
 		widget.NewFormItem("数据库路径", container.NewVBox(dbPathEntry, dbPathNote)),
 		widget.NewFormItem("最大历史记录", container.NewVBox(maxHistoryEntry, maxHistoryNote, saveMaxHistoryBtn)),
 	)
-	
+
 	return container.NewVBox(
 		widget.NewLabel("Data Settings"),
 		widget.NewSeparator(),
@@ -864,6 +914,8 @@ func (sv *SettingsView) buildDataSettings() *fyne.Container {
 			applyLimitBtn,
 		),
 		container.NewHBox(vacuumBtn),
+		widget.NewSeparator(),
+		anonymizationContainer,
 	)
 }
 
@@ -1002,7 +1054,16 @@ func (sv *SettingsView) applyHistoryLimit() {
 	confirmDialog.Show()
 }
 
-// vacuumDatabase optimizes the database
+// savePrivacyConfig saves the privacy configuration
+func (sv *SettingsView) savePrivacyConfig() {
+	if err := utils.SaveConfig(sv.app.configPath, sv.app.config); err != nil {
+		sv.app.logger.Error("Failed to save privacy settings: %v", err)
+		sv.showError("保存匿名化设置失败: " + err.Error())
+		return
+	}
+	sv.app.logger.Info("Privacy settings updated")
+}
+
 func (sv *SettingsView) vacuumDatabase(statsLabel *widget.Label) {
 	sv.app.logger.Info("Starting database vacuum...")
 	
