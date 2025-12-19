@@ -13,7 +13,6 @@ import (
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
-	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
@@ -327,84 +326,10 @@ func (a *FileUploadArea) HandleClipboardPaste() {
 		return
 	}
 	
-	// Fallback: try to get text content (for file paths as text)
-	clipboard := a.app.window.Clipboard()
-	content := clipboard.Content()
-	
-	a.app.logger.Info("Clipboard text content length: %d", len(content))
-	
-	if content == "" {
-		a.app.logger.Info("Clipboard is empty, skipping")
-		return
-	}
-	
-	// Log first 200 chars for debugging
-	logContent := content
-	if len(logContent) > 200 {
-		logContent = logContent[:200] + "..."
-	}
-	a.app.logger.Info("Clipboard text content: [%s]", logContent)
-	
-	// Try to parse as file path or URI
-	var filePath string
-	
-	if strings.HasPrefix(content, "file://") {
-		// Parse file URI
-		a.app.logger.Info("Detected file:// URI")
-		uri, err := storage.ParseURI(content)
-		if err != nil {
-			a.app.logger.Warn("Failed to parse clipboard URI: %v", err)
-			return
-		}
-		filePath = uri.Path()
-		a.app.logger.Info("Parsed URI to path: %s", filePath)
-	} else if strings.Contains(content, ":\\") || strings.HasPrefix(content, "\\\\") {
-		// Windows file path - clean it up
-		a.app.logger.Info("Detected Windows file path in text")
-		filePath = strings.TrimSpace(content)
-		// Remove quotes if present
-		filePath = strings.Trim(filePath, "\"")
-		// Handle multiple lines (first line only)
-		if idx := strings.Index(filePath, "\n"); idx > 0 {
-			filePath = filePath[:idx]
-			filePath = strings.TrimSpace(filePath)
-		}
-		// Handle carriage return
-		if idx := strings.Index(filePath, "\r"); idx > 0 {
-			filePath = filePath[:idx]
-			filePath = strings.TrimSpace(filePath)
-		}
-		a.app.logger.Info("Cleaned file path: %s", filePath)
-	} else {
-		// Not a file path, allow normal text paste
-		a.app.logger.Info("Clipboard content is not a file path, allowing text paste")
-		return
-	}
-	
-	// If we have a file path, try to process it
-	if filePath != "" {
-		a.app.logger.Info("Attempting to process clipboard file from text: %s", filePath)
-		
-		// Process file in a goroutine to avoid blocking UI
-		go func() {
-			attachment, err := a.handler.ProcessFile(filePath)
-			if err != nil {
-				a.app.logger.Warn("Failed to process clipboard file: %v", err)
-				fyne.Do(func() {
-					a.app.showError("无法处理文件: " + err.Error())
-				})
-				return
-			}
-			
-			// Add attachment on UI thread
-			fyne.Do(func() {
-				a.addAttachment(attachment)
-				a.app.logger.Info("Clipboard file added successfully: %s", attachment.Filename)
-			})
-		}()
-	} else {
-		a.app.logger.Info("File path is empty after processing")
-	}
+	// No files detected - allow normal text paste
+	// Note: Text-based file path detection has been removed to improve performance
+	// and avoid conflicts with direct file copy/paste functionality
+	a.app.logger.Info("No files detected in clipboard, allowing normal text paste")
 }
 
 // showAttachmentPreview shows a preview dialog for an attachment

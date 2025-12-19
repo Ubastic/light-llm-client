@@ -6,19 +6,19 @@ import (
 )
 
 func TestAnonymizer_DeviceIDFormats(t *testing.T) {
-	a := NewAnonymizer(true)
-	
+	a := NewAnonymizer(testPrivacyConfig(true))
+
 	// 测试你提供的真实 device_id 格式
 	text := `{
   "device_id2": "dp1_G789fgdwrwrqwerfxCOu4456456YmqYPNOasdfsdrj/82tk+//2RdfgaG3JSDFh12==",
   "deviceid": "dp1_02gzx4gasewfsadfwSTh4Fl+N5byG5Xfzn6/fTFR7dyXMTY/JJUsTLfghfgfshgG9uxfGH07tEVSInIsdfgqt2T7//ZEo2346jV"
 }`
-	
+
 	anonymized := a.Anonymize(text)
-	
+
 	t.Logf("Original:\n%s", text)
 	t.Logf("Anonymized:\n%s", anonymized)
-	
+
 	// 验证两个 device_id 都被匿名化
 	if strings.Contains(anonymized, "dp1_G789fgdwrwrqwerfxCOu4456456YmqYPNOasdfsdrj/82tk+//2RdfgaG3JSDFh12==") {
 		t.Errorf("device_id2 should be anonymized")
@@ -26,12 +26,12 @@ func TestAnonymizer_DeviceIDFormats(t *testing.T) {
 	if strings.Contains(anonymized, "dp1_02gzx4gasewfsadfwSTh4Fl+N5byG5Xfzn6/fTFR7dyXMTY/JJUsTLfghfgfshgG9uxfGH07tEVSInIsdfgqt2T7//ZEo2346jV") {
 		t.Errorf("deviceid should be anonymized")
 	}
-	
+
 	// 验证可以还原
 	deanonymized := a.Deanonymize(anonymized)
-	
+
 	t.Logf("Deanonymized:\n%s", deanonymized)
-	
+
 	if !strings.Contains(deanonymized, "dp1_G789fgdwrwrqwerfxCOu4456456YmqYPNOasdfsdrj/82tk+//2RdfgaG3JSDFh12==") {
 		t.Errorf("device_id2 should be restored")
 	}
@@ -41,8 +41,8 @@ func TestAnonymizer_DeviceIDFormats(t *testing.T) {
 }
 
 func TestAnonymizer_VariousDeviceIDFormats(t *testing.T) {
-	a := NewAnonymizer(true)
-	
+	a := NewAnonymizer(testPrivacyConfig(true))
+
 	// 测试各种 device_id 格式
 	testCases := []struct {
 		name  string
@@ -75,20 +75,20 @@ func TestAnonymizer_VariousDeviceIDFormats(t *testing.T) {
 			check: "client.prod.v1+aBcDeF123456XyZ789",
 		},
 	}
-	
+
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			anonymized := a.Anonymize(tc.text)
-			
+
 			if strings.Contains(anonymized, tc.check) {
 				t.Errorf("Value should be anonymized: %s", tc.check)
 			}
-			
+
 			deanonymized := a.Deanonymize(anonymized)
 			if !strings.Contains(deanonymized, tc.check) {
 				t.Errorf("Value should be restored: %s", tc.check)
 			}
-			
+
 			// 清除映射以便下一个测试
 			a.Clear()
 		})
@@ -96,8 +96,8 @@ func TestAnonymizer_VariousDeviceIDFormats(t *testing.T) {
 }
 
 func TestAnonymizer_ComplexRealWorldExample(t *testing.T) {
-	a := NewAnonymizer(true)
-	
+	a := NewAnonymizer(testPrivacyConfig(true))
+
 	// 真实场景：包含多种格式的敏感数据
 	text := `Request Headers:
 Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N
@@ -114,9 +114,9 @@ Request Body:
   "session_token": "sess_aBcDeF123456XyZ789GhI012JkL345MnO678",
   "hardware_id": "hw_prod_aBcDeF123456/XyZ789/GhI012"
 }`
-	
+
 	anonymized := a.Anonymize(text)
-	
+
 	// 验证所有敏感数据都被匿名化
 	sensitiveData := []string{
 		"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
@@ -130,16 +130,16 @@ Request Body:
 		"sess_aBcDeF123456XyZ789GhI012JkL345MnO678",
 		"hw_prod_aBcDeF123456/XyZ789/GhI012",
 	}
-	
+
 	for _, data := range sensitiveData {
 		if strings.Contains(anonymized, data) {
 			t.Errorf("Sensitive data should be anonymized: %s", data)
 		}
 	}
-	
+
 	// 验证可以完整还原
 	deanonymized := a.Deanonymize(anonymized)
-	
+
 	for _, data := range sensitiveData {
 		if !strings.Contains(deanonymized, data) {
 			t.Errorf("Sensitive data should be restored: %s", data)
@@ -148,8 +148,8 @@ Request Body:
 }
 
 func TestAnonymizer_SensitiveValueDetection(t *testing.T) {
-	a := NewAnonymizer(true)
-	
+	a := NewAnonymizer(testPrivacyConfig(true))
+
 	// 测试敏感值检测逻辑
 	testCases := []struct {
 		value    string
@@ -202,12 +202,12 @@ func TestAnonymizer_SensitiveValueDetection(t *testing.T) {
 			reason:   "has slashes, letters and digits",
 		},
 	}
-	
+
 	for _, tc := range testCases {
 		t.Run(tc.reason, func(t *testing.T) {
 			result := a.looksLikeSensitiveValue(tc.value)
 			if result != tc.expected {
-				t.Errorf("Value: %s, Expected: %v, Got: %v, Reason: %s", 
+				t.Errorf("Value: %s, Expected: %v, Got: %v, Reason: %s",
 					tc.value, tc.expected, result, tc.reason)
 			}
 		})
@@ -215,8 +215,8 @@ func TestAnonymizer_SensitiveValueDetection(t *testing.T) {
 }
 
 func TestAnonymizer_KeyDetection(t *testing.T) {
-	a := NewAnonymizer(true)
-	
+	a := NewAnonymizer(testPrivacyConfig(true))
+
 	// 测试各种 key 的检测
 	testCases := []struct {
 		key      string
@@ -238,10 +238,10 @@ func TestAnonymizer_KeyDetection(t *testing.T) {
 		{"title", false},
 		{"description", false},
 		{"content", false},
-		{"user_id", false},  // 普通业务 ID，不应该被检测为敏感
-		{"product_id", false},  // 普通业务 ID，不应该被检测为敏感
+		{"user_id", false},    // 普通业务 ID，不应该被检测为敏感
+		{"product_id", false}, // 普通业务 ID，不应该被检测为敏感
 	}
-	
+
 	for _, tc := range testCases {
 		t.Run(tc.key, func(t *testing.T) {
 			result := a.isSensitiveKey(tc.key)

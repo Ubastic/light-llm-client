@@ -62,7 +62,17 @@ jobs:
       run: |
         brew install pkg-config
 
-    - name: Build
+    - name: Build (Windows, no console)
+      if: matrix.os == 'windows'
+      env:
+        GOOS: ${{ matrix.os }}
+        GOARCH: ${{ matrix.arch }}
+        CGO_ENABLED: 1
+      run: |
+        go build -tags "sqlite_fts5" -ldflags="-s -w -H=windowsgui" -o ${{ matrix.output }}
+
+    - name: Build (Non-Windows)
+      if: matrix.os != 'windows'
       env:
         GOOS: ${{ matrix.os }}
         GOARCH: ${{ matrix.arch }}

@@ -20,21 +20,37 @@ import (
 type customEntry struct {
 	widget.Entry
 	onCtrlEnter func()
-	onPaste     func() // Called when Ctrl+V is pressed to handle clipboard paste
+	onPaste     func()    // Called when Ctrl+V is pressed to handle clipboard paste
+	app         *App      // Reference to app for logging and clipboard access
+	cv          *ChatView // Reference to chat view for showing warnings
 }
 
 // TypedShortcut handles keyboard shortcuts
 func (e *customEntry) TypedShortcut(shortcut fyne.Shortcut) {
 	// Check for paste shortcut (Ctrl+V)
 	if _, ok := shortcut.(*fyne.ShortcutPaste); ok {
+		// Handle file/image paste first
 		if e.onPaste != nil {
 			e.onPaste()
 		}
-		// Still allow default paste behavior for text
+
+		// Intercept text paste for optimization
+		if e.app != nil && e.cv != nil {
+			clipboardText := e.app.window.Clipboard().Content()
+			if len(clipboardText) > 0 {
+				// Check if clipboard contains large text
+				if len(clipboardText) > 10000 { // 10KB threshold
+					e.handleLargeTextPaste(clipboardText)
+					return // Don't allow default paste for large text
+				}
+			}
+		}
+
+		// Allow default paste behavior for normal text
 		e.Entry.TypedShortcut(shortcut)
 		return
 	}
-	
+
 	// Check if it's a custom keyboard shortcut
 	if ks, ok := shortcut.(*desktop.CustomShortcut); ok {
 		// Check for Ctrl+Return or Ctrl+Enter
@@ -48,6 +64,150 @@ func (e *customEntry) TypedShortcut(shortcut fyne.Shortcut) {
 	}
 	// Let the parent Entry handle other shortcuts
 	e.Entry.TypedShortcut(shortcut)
+}
+
+// handleLargeTextPaste handles pasting of large text with user confirmation
+func (e *customEntry) handleLargeTextPaste(clipboardText string) {
+	if e.app == nil || e.cv == nil {
+		// Fallback to default behavior if references not set
+		e.Entry.TypedShortcut(&fyne.ShortcutPaste{})
+		return
+	}
+
+	textSize := len(clipboardText)
+	textSizeKB := textSize / 1024
+
+	e.app.logger.Info("Large text paste detected: %d KB", textSizeKB)
+
+	// Show confirmation dialog
+	var dialog *widget.PopUp
+
+	sizeLabel := widget.NewLabel(fmt.Sprintf("检测到大文本粘贴 (%d KB)", textSizeKB))
+	sizeLabel.TextStyle = fyne.TextStyle{Bold: true}
+
+	warningLabel := widget.NewLabel("粘贴大量文本可能会导致界面短暂卡顿。")
+	warningLabel.Wrapping = fyne.TextWrapWord
+
+	tipLabel := widget.NewLabel("建议：如果文本超过100KB，请考虑以文件形式上传。")
+	tipLabel.Wrapping = fyne.TextWrapWord
+	tipLabel.TextStyle = fyne.TextStyle{Italic: true}
+
+	// Preview first 200 characters
+	preview := clipboardText
+	if len(preview) > 200 {
+		preview = preview[:200] + "..."
+	}
+	previewLabel := widget.NewLabel(preview)
+	previewLabel.Wrapping = fyne.TextWrapWord
+
+	cancelButton := widget.NewButton("取消", func() {
+		dialog.Hide()
+	})
+
+	confirmButton := widget.NewButton("继续粘贴", func() {
+		dialog.Hide()
+		// Paste in background with progress indication
+		e.pasteTextAsynchronously(clipboardText)
+	})
+	confirmButton.Importance = widget.HighImportance
+
+	content := container.NewVBox(
+		sizeLabel,
+		widget.NewSeparator(),
+		warningLabel,
+		tipLabel,
+		widget.NewSeparator(),
+		widget.NewLabel("预览:"),
+		container.NewScroll(previewLabel),
+		widget.NewSeparator(),
+		container.NewHBox(cancelButton, confirmButton),
+	)
+
+	dialog = widget.NewModalPopUp(content, e.app.window.Canvas())
+	dialog.Resize(fyne.NewSize(500, 400))
+	dialog.Show()
+}
+
+// pasteTextAsynchronously pastes text in the background to avoid blocking UI
+func (e *customEntry) pasteTextAsynchronously(text string) {
+	if e.app == nil {
+		return
+	}
+
+	e.app.logger.Info("Starting asynchronous paste of %d characters", len(text))
+
+	// Show a temporary loading indicator
+	originalPlaceholder := e.PlaceHolder
+	originalWrapping := e.Wrapping
+	fyne.Do(func() {
+		e.SetPlaceHolder("⏳ 正在粘贴文本...")
+		e.Disable()
+		// Temporarily disable wrapping to reduce layout cost during SetText for huge content.
+		// We'll restore it after the paste completes.
+		e.Wrapping = fyne.TextWrapOff
+	})
+
+	// Use SafeGo to handle the paste operation
+	utils.SafeGo(e.app.logger, "pasteTextAsynchronously", func() {
+		// Capture widget state on UI thread (Fyne widgets are not thread-safe).
+		type snapshot struct {
+			currentText string
+			cursorRow   int
+			cursorCol   int
+		}
+		snapCh := make(chan snapshot, 1)
+		fyne.Do(func() {
+			snapCh <- snapshot{
+				currentText: e.Text,
+				cursorRow:   e.CursorRow,
+				cursorCol:   e.CursorColumn,
+			}
+		})
+		snap := <-snapCh
+
+		// Compute insertion in background (keep heavy string work off the UI thread).
+		insertPos := byteIndexAtCursor(snap.currentText, snap.cursorRow, snap.cursorCol)
+		newText := snap.currentText[:insertPos] + text + snap.currentText[insertPos:]
+
+		// Apply the update on UI thread once (multiple SetText calls make things slower).
+		done := make(chan struct{})
+		fyne.Do(func() {
+			e.SetText(newText)
+			e.SetPlaceHolder(originalPlaceholder)
+			e.Wrapping = originalWrapping
+			e.Enable()
+			close(done)
+		})
+		<-done
+
+		e.app.logger.Info("Asynchronous paste completed")
+	})
+}
+
+// byteIndexAtCursor converts (row, col) cursor position into a byte index in text.
+// It clamps to the end of the string if the cursor is beyond the current content.
+func byteIndexAtCursor(text string, row, col int) int {
+	if row <= 0 && col <= 0 {
+		return 0
+	}
+
+	currentRow := 0
+	currentCol := 0
+
+	for i, r := range text {
+		if currentRow == row && currentCol == col {
+			return i
+		}
+
+		if r == '\n' {
+			currentRow++
+			currentCol = 0
+		} else {
+			currentCol++
+		}
+	}
+
+	return len(text)
 }
 
 // TypedKey intercepts key events as a fallback
@@ -75,7 +235,7 @@ func (e *customEntry) TypedKey(key *fyne.KeyEvent) {
 func newSelectableText(text string) *widget.RichText {
 	richText := widget.NewRichText()
 	richText.Wrapping = fyne.TextWrapBreak
-	
+
 	// Always use plain text segment - do NOT parse markdown
 	// This prevents Fyne's markdown parser bugs from causing layout issues
 	segment := &widget.TextSegment{
@@ -84,7 +244,7 @@ func newSelectableText(text string) *widget.RichText {
 	}
 	richText.Segments = []widget.RichTextSegment{segment}
 	richText.Refresh()
-	
+
 	return richText
 }
 
@@ -93,10 +253,10 @@ func newSelectableText(text string) *widget.RichText {
 func newSelectableMarkdownText(text string) *widget.RichText {
 	richText := widget.NewRichText()
 	richText.Wrapping = fyne.TextWrapBreak
-	
+
 	// Parse markdown for assistant messages
 	richText.ParseMarkdown(text)
-	
+
 	return richText
 }
 
@@ -116,26 +276,26 @@ func newSelectableCodeText(text string) *widget.RichText {
 
 // ChatView represents the chat interface
 type ChatView struct {
-	app              *App
-	conversationID   int64
-	currentProvider  string
+	app               *App
+	conversationID    int64
+	currentProvider   string
 	messagesContainer *fyne.Container
-	inputEntry       *customEntry
-	sendButton       *widget.Button
-	providerSelect   *widget.Select
-	fileUploadArea   *FileUploadArea
-	messages         []db.Message // Store the actual messages for reference
+	inputEntry        *customEntry
+	sendButton        *widget.Button
+	providerSelect    *widget.Select
+	fileUploadArea    *FileUploadArea
+	messages          []db.Message // Store the actual messages for reference
 	// Track which messages are showing anonymized content (true = showing anonymized, false = showing original)
-	showAnonymized   map[int]bool
+	showAnonymized map[int]bool
 	// Cache for messages and UI components to prevent flickering
-	messageCache     []db.Message
-	uiCache          []fyne.CanvasObject
+	messageCache []db.Message
+	uiCache      []fyne.CanvasObject
 }
 
 // streamChatWithRetry attempts to stream chat with retry logic
 func (cv *ChatView) streamChatWithRetry(ctx context.Context, provider llm.Provider, messages []llm.Message, maxRetries int) (<-chan llm.StreamResponse, error) {
 	var lastErr error
-	
+
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
 			// Exponential backoff: 1s, 2s, 4s
@@ -143,7 +303,7 @@ func (cv *ChatView) streamChatWithRetry(ctx context.Context, provider llm.Provid
 			cv.app.logger.Info("Retrying in %v (attempt %d/%d)...", waitTime, attempt, maxRetries)
 			time.Sleep(waitTime)
 		}
-		
+
 		stream, err := provider.StreamChat(ctx, messages)
 		if err == nil {
 			if attempt > 0 {
@@ -151,17 +311,17 @@ func (cv *ChatView) streamChatWithRetry(ctx context.Context, provider llm.Provid
 			}
 			return stream, nil
 		}
-		
+
 		lastErr = err
 		cv.app.logger.Warn("Stream chat attempt %d failed: %v", attempt+1, err)
-		
+
 		// Check if error is retryable (network errors, timeouts, etc.)
 		if !isRetryableError(err) {
 			cv.app.logger.Info("Error is not retryable, stopping retry attempts")
 			break
 		}
 	}
-	
+
 	return nil, fmt.Errorf("failed after %d attempts: %w", maxRetries+1, lastErr)
 }
 
@@ -170,9 +330,9 @@ func isRetryableError(err error) bool {
 	if err == nil {
 		return false
 	}
-	
+
 	errStr := strings.ToLower(err.Error())
-	
+
 	// Network-related errors that should be retried
 	retryableErrors := []string{
 		"connection refused",
@@ -186,13 +346,13 @@ func isRetryableError(err error) bool {
 		"connection timed out",
 		"eof",
 	}
-	
+
 	for _, retryable := range retryableErrors {
 		if strings.Contains(errStr, retryable) {
 			return true
 		}
 	}
-	
+
 	return false
 }
 
@@ -241,7 +401,10 @@ func (cv *ChatView) Build() fyne.CanvasObject {
 	})
 
 	// Input area - use custom entry to handle Ctrl+Enter and Ctrl+V
-	cv.inputEntry = &customEntry{}
+	cv.inputEntry = &customEntry{
+		app: cv.app,
+		cv:  cv,
+	}
 	cv.inputEntry.MultiLine = true
 	cv.inputEntry.Wrapping = fyne.TextWrapBreak
 	cv.inputEntry.SetPlaceHolder("输入消息... (Ctrl+Enter 发送, Ctrl+V 粘贴图片/文件)")
@@ -317,7 +480,7 @@ func (cv *ChatView) loadMessages() {
 			cv.messagesContainer.Objects = []fyne.CanvasObject{}
 			cv.messagesContainer.Refresh()
 		})
-		cv.messages = nil // Clear messages when no conversation
+		cv.messages = nil                      // Clear messages when no conversation
 		cv.showAnonymized = make(map[int]bool) // Clear showAnonymized map
 		return
 	}
@@ -326,19 +489,19 @@ func (cv *ChatView) loadMessages() {
 	if cachedUI, cached := cv.app.uiCache[cv.conversationID]; cached {
 		cv.app.updateCacheAccess(cv.conversationID) // Update LRU
 		cv.app.logger.Info("Using cached UI for conversation %d (%d objects)", cv.conversationID, len(cachedUI))
-		
+
 		// For large conversations, use progressive rendering
 		if len(cachedUI) > 10 {
 			// Show first 5 messages immediately
 			initialBatch := cachedUI[:5]
 			cv.messagesContainer.Objects = initialBatch
 			cv.messagesContainer.Refresh()
-			
+
 			// Load rest progressively in background
 			utils.SafeGo(cv.app.logger, "progressive-render", func() {
 				// Small delay to let UI settle
 				time.Sleep(10 * time.Millisecond)
-				
+
 				fyne.Do(func() {
 					cv.messagesContainer.Objects = cachedUI
 					cv.messagesContainer.Refresh()
@@ -349,7 +512,7 @@ func (cv *ChatView) loadMessages() {
 			cv.messagesContainer.Objects = cachedUI
 			cv.messagesContainer.Refresh()
 		}
-		
+
 		// Update messages field from cached data
 		if cachedMessages, cached := cv.app.messageCache[cv.conversationID]; cached {
 			cv.messages = make([]db.Message, len(cachedMessages))
@@ -361,12 +524,12 @@ func (cv *ChatView) loadMessages() {
 		}
 		return
 	}
-	
+
 	// Check if messages are already cached (fast path)
 	if cachedMessages, cached := cv.app.messageCache[cv.conversationID]; cached {
 		cv.app.updateCacheAccess(cv.conversationID) // Update LRU
 		cv.app.logger.Info("Using cached messages for conversation %d", cv.conversationID)
-		
+
 		// Update messages field from cache
 		cv.messages = make([]db.Message, len(cachedMessages))
 		for i, msg := range cachedMessages {
@@ -374,7 +537,7 @@ func (cv *ChatView) loadMessages() {
 		}
 		// Synchronize showAnonymized map with message indices
 		cv.syncShowAnonymizedMap()
-		
+
 		// Build UI from cached messages in background
 		utils.SafeGo(cv.app.logger, "loadMessages-cached", func() {
 			uiObjects := make([]fyne.CanvasObject, 0, len(cachedMessages)*4)
@@ -382,10 +545,10 @@ func (cv *ChatView) loadMessages() {
 				messageBox := cv.buildMessageUI(msg, i)
 				uiObjects = append(uiObjects, messageBox)
 			}
-			
+
 			// Cache the UI objects for next time
 			cv.app.uiCache[cv.conversationID] = uiObjects
-			
+
 			fyne.Do(func() {
 				cv.messagesContainer.Objects = uiObjects
 				cv.messagesContainer.Refresh()
@@ -428,7 +591,7 @@ func (cv *ChatView) loadMessages() {
 		for i, msg := range messages {
 			cv.messages[i] = *msg
 		}
-		
+
 		// Synchronize showAnonymized map with message indices
 		cv.syncShowAnonymizedMap()
 
@@ -438,7 +601,7 @@ func (cv *ChatView) loadMessages() {
 			messageBox := cv.buildMessageUI(msg, i)
 			uiObjects = append(uiObjects, messageBox)
 		}
-		
+
 		// Cache the UI objects for future use
 		cv.app.uiCache[cv.conversationID] = uiObjects
 
@@ -536,8 +699,8 @@ func (cv *ChatView) showAnonymizationConfirmation(originalContent, anonymizedCon
 			widget.NewLabel("匿名化后消息:"),
 			container.NewHBox(cancelButton, confirmButton),
 		),
-		nil, // Left
-		nil, // Right
+		nil,          // Left
+		nil,          // Right
 		messageSplit, // Center (will expand)
 	)
 
@@ -551,10 +714,10 @@ func (cv *ChatView) showAnonymizationConfirmation(originalContent, anonymizedCon
 }
 
 // proceedWithMessage contains the core logic to save and send a message
-// content parameter can be either original content (when anonymization is disabled) 
+// content parameter can be either original content (when anonymization is disabled)
 // or anonymized content (when anonymization is enabled)
 func (cv *ChatView) proceedWithMessage(content string, attachments []*llm.Attachment) {
-	
+
 	if content == "" && len(attachments) == 0 {
 		return
 	}
@@ -574,7 +737,7 @@ func (cv *ChatView) proceedWithMessage(content string, attachments []*llm.Attach
 	// Process attachments: separate images from text files
 	var imageAttachments []llm.Attachment
 	var textFileContents []string
-	
+
 	for _, att := range attachments {
 		if att.Type == "image" {
 			// Images are sent as attachments
@@ -585,8 +748,7 @@ func (cv *ChatView) proceedWithMessage(content string, attachments []*llm.Attach
 			textFileContents = append(textFileContents, fmt.Sprintf("\n\n--- 文件: %s ---\n%s\n--- 文件结束 ---\n", att.Filename, fileContent))
 		}
 	}
-	
-	
+
 	// Serialize all attachments to JSON for database storage
 	attachmentsJSON := ""
 	if len(attachments) > 0 {
@@ -602,12 +764,12 @@ func (cv *ChatView) proceedWithMessage(content string, attachments []*llm.Attach
 	// If anonymization is enabled and we have original content stored, save both
 	var message *db.Message
 	var err error
-	
+
 	if cv.app.anonymizer.IsEnabled() && cv.app.anonymizer.GetMappingCount() > 0 {
 		// Anonymization is enabled - we need to store both original and anonymized content
 		// Get the original content from the anonymizer's reverse mapping
 		originalContent := cv.app.anonymizer.Deanonymize(content)
-		
+
 		// Create message with anonymized content as main content
 		message, err = cv.app.db.CreateMessage(cv.conversationID, "user", content, "", "", attachmentsJSON, 0)
 		if err != nil {
@@ -615,12 +777,12 @@ func (cv *ChatView) proceedWithMessage(content string, attachments []*llm.Attach
 			cv.app.showError("Failed to save user message: " + err.Error())
 			return
 		}
-		
+
 		// Update the message with original content
 		if err := cv.app.db.UpdateMessageOriginalContent(message.ID, originalContent); err != nil {
 			cv.app.logger.Error("Failed to update message original content: %v", err)
 		}
-		
+
 		// Display the original content in UI
 		cv.addMessageToUI("user", originalContent, "", -1)
 		// Update cache immediately after user message
@@ -633,14 +795,14 @@ func (cv *ChatView) proceedWithMessage(content string, attachments []*llm.Attach
 			cv.app.showError("Failed to save user message: " + err.Error())
 			return
 		}
-		
+
 		// Display the content in UI
 		cv.addMessageToUI("user", content, "", -1)
 		// Update cache immediately after user message
 		cv.updateCacheAfterNewMessage(*message)
 	}
 	cv.inputEntry.SetText("")
-	
+
 	// Clear attachments after sending
 	cv.fileUploadArea.Clear()
 
@@ -668,7 +830,7 @@ func (cv *ChatView) proceedWithMessage(content string, attachments []*llm.Attach
 				cv.app.logger.Warn("Failed to parse attachments for message %d: %v", msg.ID, err)
 			}
 		}
-		
+
 		// Only include image attachments for LLM (text files are already in content)
 		var imageAttachments []llm.Attachment
 		for _, att := range allAttachments {
@@ -676,11 +838,11 @@ func (cv *ChatView) proceedWithMessage(content string, attachments []*llm.Attach
 				imageAttachments = append(imageAttachments, att)
 			}
 		}
-		
+
 		// Anonymization is now handled before calling proceedWithMessage
 		// We send the already-anonymized content to the LLM
 		anonymizedContent := msg.Content
-		
+
 		llmMessages = append(llmMessages, llm.Message{
 			Role:        msg.Role,
 			Content:     anonymizedContent,
@@ -693,10 +855,10 @@ func (cv *ChatView) proceedWithMessage(content string, attachments []*llm.Attach
 	assistantRichText.Wrapping = fyne.TextWrapBreak
 	assistantRoleLabel := widget.NewLabel("🤖 助手 (" + cv.currentProvider + ")")
 	assistantRoleLabel.TextStyle = fyne.TextStyle{Bold: true}
-	
+
 	// Add initial "thinking" message
 	assistantRichText.ParseMarkdown("*思考中...*")
-	
+
 	fyne.Do(func() {
 		cv.messagesContainer.Add(container.NewVBox(
 			assistantRoleLabel,
@@ -787,63 +949,63 @@ func (cv *ChatView) proceedWithMessage(content string, attachments []*llm.Attach
 			}
 
 			if chunk.Done {
-    // Deanonymize the final response before saving
-    finalResponse := cv.app.anonymizer.Deanonymize(fullResponse.String())
-    
-    // Save assistant message (with original sensitive data restored)
-    assistantMsg, err := cv.app.db.CreateMessage(
-        cv.conversationID,
-        "assistant",
-        finalResponse,
-        cv.currentProvider,
-        cv.currentProvider,
-        "",
-        0,
-    )
-    if err != nil {
-        cv.app.logger.Error("Failed to save assistant message: %v", err)
-    } else {
-        // Add the assistant message to cv.messages array
-        cv.addMessageToMessagesArray(*assistantMsg)
-        
-        // Update cache immediately with the new message
-        cv.updateCacheAfterNewMessage(*assistantMsg)
-        
-        // 【关键修改】：不要调用 loadMessages()，而是直接更新当前消息的UI
-        // 将临时的流式显示替换为完整的带按钮的消息UI
-        fyne.Do(func() {
-            // 获取最后一个消息的索引
-            lastIndex := len(cv.messagesContainer.Objects) - 1
-            if lastIndex >= 0 {
-                // 创建完整的消息UI（包含所有按钮）
-                messageIndex := len(cv.messages) - 1
-                completeMessageUI := cv.buildMessageUI(assistantMsg, messageIndex)
-                
-                // 替换临时UI
-                cv.messagesContainer.Objects[lastIndex] = completeMessageUI
-                cv.messagesContainer.Refresh()
-                
-                // 更新UI缓存
-                if cv.app.uiCache != nil {
-                    cv.app.uiCache[cv.conversationID] = append([]fyne.CanvasObject{}, cv.messagesContainer.Objects...)
-                }
-            }
-        })
-    }
-    
-    // Clear anonymization mappings for next conversation turn
-    cv.app.anonymizer.Clear()
-    
-    // Auto-generate title if this is the first exchange
-    utils.SafeGo(cv.app.logger, "autoGenerateTitle", cv.autoGenerateTitle)
-    
-    // 【删除这一行】：不要重新加载消息
-    // cv.loadMessages()
-    
-    break
-}
-	}
-})
+				// Deanonymize the final response before saving
+				finalResponse := cv.app.anonymizer.Deanonymize(fullResponse.String())
+
+				// Save assistant message (with original sensitive data restored)
+				assistantMsg, err := cv.app.db.CreateMessage(
+					cv.conversationID,
+					"assistant",
+					finalResponse,
+					cv.currentProvider,
+					cv.currentProvider,
+					"",
+					0,
+				)
+				if err != nil {
+					cv.app.logger.Error("Failed to save assistant message: %v", err)
+				} else {
+					// Add the assistant message to cv.messages array
+					cv.addMessageToMessagesArray(*assistantMsg)
+
+					// Update cache immediately with the new message
+					cv.updateCacheAfterNewMessage(*assistantMsg)
+
+					// 【关键修改】：不要调用 loadMessages()，而是直接更新当前消息的UI
+					// 将临时的流式显示替换为完整的带按钮的消息UI
+					fyne.Do(func() {
+						// 获取最后一个消息的索引
+						lastIndex := len(cv.messagesContainer.Objects) - 1
+						if lastIndex >= 0 {
+							// 创建完整的消息UI（包含所有按钮）
+							messageIndex := len(cv.messages) - 1
+							completeMessageUI := cv.buildMessageUI(assistantMsg, messageIndex)
+
+							// 替换临时UI
+							cv.messagesContainer.Objects[lastIndex] = completeMessageUI
+							cv.messagesContainer.Refresh()
+
+							// 更新UI缓存
+							if cv.app.uiCache != nil {
+								cv.app.uiCache[cv.conversationID] = append([]fyne.CanvasObject{}, cv.messagesContainer.Objects...)
+							}
+						}
+					})
+				}
+
+				// Clear anonymization mappings for next conversation turn
+				cv.app.anonymizer.Clear()
+
+				// Auto-generate title if this is the first exchange
+				utils.SafeGo(cv.app.logger, "autoGenerateTitle", cv.autoGenerateTitle)
+
+				// 【删除这一行】：不要重新加载消息
+				// cv.loadMessages()
+
+				break
+			}
+		}
+	})
 }
 
 // autoGenerateTitle automatically generates a title for the conversation
@@ -851,38 +1013,38 @@ func (cv *ChatView) autoGenerateTitle() {
 	if cv.conversationID == 0 {
 		return
 	}
-	
+
 	// Get the conversation to check current title
 	conv, err := cv.app.db.GetConversation(cv.conversationID)
 	if err != nil {
 		cv.app.logger.Error("Failed to get conversation: %v", err)
 		return
 	}
-	
+
 	// Only generate title if it's still "New Chat"
 	if conv.Title != "New Chat" {
 		return
 	}
-	
+
 	// Get messages
 	dbMessages, err := cv.app.db.ListMessages(cv.conversationID)
 	if err != nil {
 		cv.app.logger.Error("Failed to load messages for title generation: %v", err)
 		return
 	}
-	
+
 	// Only generate if we have at least 2 messages (user + assistant)
 	if len(dbMessages) < 2 {
 		return
 	}
-	
+
 	// Get provider
 	provider, ok := cv.app.providers[cv.currentProvider]
 	if !ok {
 		cv.app.logger.Warn("Provider not found for title generation: %s", cv.currentProvider)
 		return
 	}
-	
+
 	// Convert to LLM messages
 	llmMessages := []llm.Message{}
 	for _, msg := range dbMessages {
@@ -891,7 +1053,7 @@ func (cv *ChatView) autoGenerateTitle() {
 			Content: msg.Content,
 		})
 	}
-	
+
 	// Generate title with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -900,19 +1062,19 @@ func (cv *ChatView) autoGenerateTitle() {
 		cv.app.logger.Error("Failed to generate title: %v", err)
 		return
 	}
-	
+
 	// Update conversation title
 	err = cv.app.db.UpdateConversation(cv.conversationID, title, conv.Category)
 	if err != nil {
 		cv.app.logger.Error("Failed to update conversation title: %v", err)
 		return
 	}
-	
+
 	cv.app.logger.Info("Auto-generated title: %s", title)
-	
+
 	// Refresh sidebar to show new title
 	cv.app.RefreshSidebar()
-	
+
 	// Update tab title if open
 	fyne.Do(func() {
 		if tabItem, exists := cv.app.tabItems[cv.conversationID]; exists {
@@ -938,23 +1100,23 @@ func (cv *ChatView) buildMessageUI(msg *db.Message, messageIndex int) fyne.Canva
 	// Create role label with bold style
 	roleWidget := widget.NewLabel(roleLabel)
 	roleWidget.TextStyle = fyne.TextStyle{Bold: true}
-	
+
 	// Check if this message has been anonymized (has original content different from current content)
 	hasAnonymizedContent := msg.OriginalContent != "" && msg.OriginalContent != msg.Content
-	
+
 	// Create role container that will hold the role label and any indicators
 	var roleContainer fyne.CanvasObject = roleWidget
-	
+
 	// Add anonymization indicator if message has been anonymized
 	if hasAnonymizedContent {
 		// Add subtle indicator that this message has been anonymized
 		anonymizedLabel := widget.NewLabel("🔒 已匿名化")
 		anonymizedLabel.TextStyle = fyne.TextStyle{Italic: true}
-		
+
 		// Create a container with role label and anonymization indicator
 		roleContainer = container.NewHBox(roleWidget, anonymizedLabel)
 	}
-	
+
 	// Determine which content to display based on user preference
 	displayContent := msg.Content
 	if msg.OriginalContent != "" {
@@ -966,7 +1128,7 @@ func (cv *ChatView) buildMessageUI(msg *db.Message, messageIndex int) fyne.Canva
 			displayContent = msg.OriginalContent
 		}
 	}
-	
+
 	var contentWidget fyne.CanvasObject
 	if msg.Role == "assistant" {
 		// Assistant messages: parse and render with code block copy buttons
@@ -987,27 +1149,27 @@ func (cv *ChatView) buildMessageUI(msg *db.Message, messageIndex int) fyne.Canva
 			cv.app.logger.Info("Message text copied to clipboard")
 		})
 		copyTextButton.Importance = widget.LowImportance
-		
+
 		copyMarkdownButton := widget.NewButton("📄 复制 Markdown", func() {
 			// Copy original markdown content
 			cv.app.window.Clipboard().SetContent(displayContent)
 			cv.app.logger.Info("Message markdown copied to clipboard")
 		})
 		copyMarkdownButton.Importance = widget.LowImportance
-		
+
 		// Capture messageIndex in closure
 		idx := messageIndex
-		
+
 		editButton := widget.NewButton("✏️ 编辑", func() {
 			cv.editMessage(idx, displayContent)
 		})
 		editButton.Importance = widget.LowImportance
-		
+
 		regenerateButton := widget.NewButton("🔄 重新生成", func() {
 			cv.regenerateMessage(idx)
 		})
 		regenerateButton.Importance = widget.LowImportance
-		
+
 		actionButtons = container.NewHBox(copyTextButton, copyMarkdownButton, editButton, regenerateButton)
 	} else {
 		// For user messages, add copy, edit, and delete buttons
@@ -1016,22 +1178,22 @@ func (cv *ChatView) buildMessageUI(msg *db.Message, messageIndex int) fyne.Canva
 			cv.app.logger.Info("Message copied to clipboard")
 		})
 		copyButton.Importance = widget.LowImportance
-		
+
 		// Capture messageIndex in closure
 		idx := messageIndex
 		editButton := widget.NewButton("✏️ 编辑", func() {
 			cv.editMessage(idx, displayContent)
 		})
 		editButton.Importance = widget.LowImportance
-		
+
 		deleteButton := widget.NewButton("🗑️ 删除", func() {
 			cv.deleteMessage(idx)
 		})
 		deleteButton.Importance = widget.LowImportance
-		
+
 		actionButtons = container.NewHBox(copyButton, editButton, deleteButton)
 	}
-	
+
 	// Add anonymization toggle button if message has both original and anonymized content
 	if hasAnonymizedContent {
 		// Determine button text based on current state
@@ -1039,14 +1201,14 @@ func (cv *ChatView) buildMessageUI(msg *db.Message, messageIndex int) fyne.Canva
 		if messageIndex >= 0 && messageIndex < len(cv.messages) && cv.showAnonymized[messageIndex] {
 			buttonText = "👁️ 显示原始内容"
 		}
-		
+
 		// Create toggle button for switching between original and anonymized content
 		toggleButton := widget.NewButton(buttonText, func() {
 			// Toggle between original and anonymized content
 			cv.toggleMessageContent(messageIndex)
 		})
 		toggleButton.Importance = widget.LowImportance
-		
+
 		// Add the toggle button to the action buttons
 		if actionButtons != nil {
 			actionButtons.Objects = append(actionButtons.Objects, toggleButton)
@@ -1074,7 +1236,7 @@ func (cv *ChatView) addMessageToMessagesArray(msg db.Message) {
 func (cv *ChatView) syncShowAnonymizedMap() {
 	// Create a new map with the correct size
 	newMap := make(map[int]bool)
-	
+
 	// Copy existing preferences for messages that still exist
 	for i := 0; i < len(cv.messages); i++ {
 		if val, exists := cv.showAnonymized[i]; exists {
@@ -1084,7 +1246,7 @@ func (cv *ChatView) syncShowAnonymizedMap() {
 			newMap[i] = false
 		}
 	}
-	
+
 	cv.showAnonymized = newMap
 }
 
@@ -1093,15 +1255,15 @@ func (cv *ChatView) toggleMessageContent(messageIndex int) {
 	if messageIndex < 0 || messageIndex >= len(cv.messages) {
 		return
 	}
-	
+
 	msg := cv.messages[messageIndex]
 	if msg.OriginalContent == "" || msg.OriginalContent == msg.Content {
 		return // No anonymized content to toggle
 	}
-	
+
 	// Toggle the display preference for this message
 	cv.showAnonymized[messageIndex] = !cv.showAnonymized[messageIndex]
-	
+
 	// Reload the message to reflect the new state
 	cv.reloadMessage(messageIndex)
 }
@@ -1111,13 +1273,13 @@ func (cv *ChatView) reloadMessage(messageIndex int) {
 	if messageIndex < 0 || messageIndex >= len(cv.messages) {
 		return
 	}
-	
+
 	// Get the message to reload
 	msg := cv.messages[messageIndex]
-	
+
 	// Create new message UI
 	newMessageUI := cv.buildMessageUI(&msg, messageIndex)
-	
+
 	// Replace the old message UI with the new one
 	fyne.Do(func() {
 		// Remove the old message
@@ -1136,13 +1298,13 @@ func (cv *ChatView) addMessageToUI(role, content, model string, messageIndex int
 		Model:   model,
 		// OriginalContent will be empty for new messages
 	}
-	
+
 	// If this is a new message (messageIndex == -1), add it to cv.messages array
 	if messageIndex == -1 {
 		cv.addMessageToMessagesArray(*msg)
 		messageIndex = len(cv.messages) - 1
 	}
-	
+
 	messageBox := cv.buildMessageUI(msg, messageIndex)
 	fyne.Do(func() {
 		cv.messagesContainer.Add(messageBox)
@@ -1157,23 +1319,23 @@ func (cv *ChatView) renderAssistantMessage(content string) fyne.CanvasObject {
 	hasCodeBlock := strings.Contains(content, "```")
 	hasTable := strings.Contains(content, "|")
 	hasThinking := strings.Contains(content, "<think>")
-	
+
 	if !hasCodeBlock && !hasTable && !hasThinking {
 		// Pure text message with markdown formatting
 		return newSelectableMarkdownText(content)
 	}
-	
+
 	// Parse content to find code blocks, tables, and thinking sections
 	parts := cv.parseMarkdownContent(content)
-	
+
 	if len(parts) == 1 && parts[0].isCode == false && parts[0].isTable == false && parts[0].isThinking == false {
 		// No special content after parsing, use markdown text
 		return newSelectableMarkdownText(content)
 	}
-	
+
 	// Build UI with special sections
 	contentContainer := container.NewVBox()
-	
+
 	for _, part := range parts {
 		if part.isThinking {
 			// Create collapsible thinking section
@@ -1186,10 +1348,10 @@ func (cv *ChatView) renderAssistantMessage(content string) fyne.CanvasObject {
 				languageLabel = widget.NewLabel("📝 " + part.language)
 				languageLabel.TextStyle = fyne.TextStyle{Bold: true, Italic: true}
 			}
-			
+
 			// Create code block with copy button - use monospace text
 			codeText := newSelectableCodeText(part.content)
-			
+
 			// Capture code content in closure
 			code := part.content
 			copyCodeButton := widget.NewButton("📋 复制代码", func() {
@@ -1197,7 +1359,7 @@ func (cv *ChatView) renderAssistantMessage(content string) fyne.CanvasObject {
 				cv.app.logger.Info("Code copied to clipboard")
 			})
 			copyCodeButton.Importance = widget.LowImportance
-			
+
 			// Create header with language and copy button
 			var header fyne.CanvasObject
 			if languageLabel != nil {
@@ -1205,7 +1367,7 @@ func (cv *ChatView) renderAssistantMessage(content string) fyne.CanvasObject {
 			} else {
 				header = container.NewHBox(copyCodeButton)
 			}
-			
+
 			// Code block container with button (no scroll, let it expand naturally)
 			codeBlock := container.NewBorder(
 				header, // Put language and button at top
@@ -1214,7 +1376,7 @@ func (cv *ChatView) renderAssistantMessage(content string) fyne.CanvasObject {
 				nil,
 				codeText,
 			)
-			
+
 			contentContainer.Add(codeBlock)
 		} else if part.isTable {
 			// Render table
@@ -1229,7 +1391,7 @@ func (cv *ChatView) renderAssistantMessage(content string) fyne.CanvasObject {
 			}
 		}
 	}
-	
+
 	return contentContainer
 }
 
@@ -1239,12 +1401,12 @@ func (cv *ChatView) createThinkingSection(thinkingContent string) fyne.CanvasObj
 	thinkingText := newSelectableMarkdownText(thinkingContent)
 	thinkingContainer := container.NewVBox(thinkingText)
 	thinkingContainer.Hide() // Initially hidden
-	
+
 	// Create toggle button
 	isExpanded := false
 	toggleButton := widget.NewButton("💭 显示思考过程", nil)
 	toggleButton.Importance = widget.LowImportance
-	
+
 	// Set up toggle functionality
 	toggleButton.OnTapped = func() {
 		isExpanded = !isExpanded
@@ -1257,14 +1419,14 @@ func (cv *ChatView) createThinkingSection(thinkingContent string) fyne.CanvasObj
 		}
 		toggleButton.Refresh()
 	}
-	
+
 	// Create a styled container for the thinking section
 	thinkingSection := container.NewVBox(
 		toggleButton,
 		thinkingContainer,
 		widget.NewSeparator(),
 	)
-	
+
 	return thinkingSection
 }
 
@@ -1280,10 +1442,10 @@ type markdownPart struct {
 // parseMarkdownContent parses markdown and extracts code blocks, tables, and thinking sections
 func (cv *ChatView) parseMarkdownContent(markdown string) []markdownPart {
 	var parts []markdownPart
-	
+
 	// First pass: extract <think> tags
 	thinkingParts := cv.extractThinkingTags(markdown)
-	
+
 	// Second pass: extract code blocks and tables from each part
 	for _, part := range thinkingParts {
 		if part.isThinking {
@@ -1295,7 +1457,7 @@ func (cv *ChatView) parseMarkdownContent(markdown string) []markdownPart {
 			parts = append(parts, processedParts...)
 		}
 	}
-	
+
 	return parts
 }
 
@@ -1303,7 +1465,7 @@ func (cv *ChatView) parseMarkdownContent(markdown string) []markdownPart {
 func (cv *ChatView) extractThinkingTags(content string) []markdownPart {
 	var parts []markdownPart
 	var currentPart strings.Builder
-	
+
 	// Use regex-like approach to find <think> tags
 	for {
 		thinkStart := strings.Index(content, "<think>")
@@ -1320,7 +1482,7 @@ func (cv *ChatView) extractThinkingTags(content string) []markdownPart {
 			}
 			break
 		}
-		
+
 		// Add content before <think>
 		if thinkStart > 0 || currentPart.Len() > 0 {
 			currentPart.WriteString(content[:thinkStart])
@@ -1332,7 +1494,7 @@ func (cv *ChatView) extractThinkingTags(content string) []markdownPart {
 				currentPart.Reset()
 			}
 		}
-		
+
 		// Find closing </think>
 		content = content[thinkStart+7:] // Skip "<think>"
 		thinkEnd := strings.Index(content, "</think>")
@@ -1344,18 +1506,18 @@ func (cv *ChatView) extractThinkingTags(content string) []markdownPart {
 			})
 			break
 		}
-		
+
 		// Add thinking content
 		thinkingContent := content[:thinkEnd]
 		parts = append(parts, markdownPart{
 			content:    strings.TrimSpace(thinkingContent),
 			isThinking: true,
 		})
-		
+
 		// Continue with content after </think>
 		content = content[thinkEnd+8:] // Skip "</think>"
 	}
-	
+
 	return parts
 }
 
@@ -1365,14 +1527,14 @@ func (cv *ChatView) extractCodeBlocksAndTables(markdown string) []markdownPart {
 	var currentPart strings.Builder
 	inCodeBlock := false
 	var currentLanguage string
-	
+
 	lines := strings.Split(markdown, "\n")
-	
+
 	// Extract code blocks
 	i := 0
 	for i < len(lines) {
 		line := lines[i]
-		
+
 		if strings.HasPrefix(line, "```") {
 			if inCodeBlock {
 				// End of code block
@@ -1406,7 +1568,7 @@ func (cv *ChatView) extractCodeBlocksAndTables(markdown string) []markdownPart {
 		}
 		i++
 	}
-	
+
 	// Add remaining content
 	if currentPart.Len() > 0 {
 		if inCodeBlock {
@@ -1420,7 +1582,7 @@ func (cv *ChatView) extractCodeBlocksAndTables(markdown string) []markdownPart {
 			parts = append(parts, processedParts...)
 		}
 	}
-	
+
 	return parts
 }
 
@@ -1430,15 +1592,15 @@ func (cv *ChatView) extractTablesFromText(text string) []markdownPart {
 	var currentPart strings.Builder
 	var tableLines []string
 	inTable := false
-	
+
 	lines := strings.Split(text, "\n")
-	
+
 	for i, line := range lines {
 		trimmedLine := strings.TrimSpace(line)
-		
+
 		// Check if line looks like a table row (contains |)
 		isTableLine := strings.Contains(trimmedLine, "|") && len(trimmedLine) > 0
-		
+
 		if isTableLine {
 			if !inTable {
 				// Start of table - save previous content
@@ -1470,14 +1632,14 @@ func (cv *ChatView) extractTablesFromText(text string) []markdownPart {
 				tableLines = nil
 				inTable = false
 			}
-			
+
 			currentPart.WriteString(line)
 			if i < len(lines)-1 {
 				currentPart.WriteString("\n")
 			}
 		}
 	}
-	
+
 	// Handle remaining table
 	if inTable && len(tableLines) > 0 {
 		if cv.isValidMarkdownTable(tableLines) {
@@ -1490,7 +1652,7 @@ func (cv *ChatView) extractTablesFromText(text string) []markdownPart {
 			currentPart.WriteString(strings.Join(tableLines, "\n"))
 		}
 	}
-	
+
 	// Add remaining content
 	if currentPart.Len() > 0 {
 		parts = append(parts, markdownPart{
@@ -1499,7 +1661,7 @@ func (cv *ChatView) extractTablesFromText(text string) []markdownPart {
 			isTable: false,
 		})
 	}
-	
+
 	return parts
 }
 
@@ -1508,13 +1670,13 @@ func (cv *ChatView) isValidMarkdownTable(lines []string) bool {
 	if len(lines) < 2 {
 		return false
 	}
-	
+
 	// Check if second line is a separator line (contains dashes and pipes)
 	secondLine := strings.TrimSpace(lines[1])
 	if !strings.Contains(secondLine, "-") || !strings.Contains(secondLine, "|") {
 		return false
 	}
-	
+
 	// Validate separator line format
 	parts := strings.Split(secondLine, "|")
 	validSeparators := 0
@@ -1531,7 +1693,7 @@ func (cv *ChatView) isValidMarkdownTable(lines []string) bool {
 			validSeparators++
 		}
 	}
-	
+
 	return validSeparators >= 1
 }
 
@@ -1541,7 +1703,7 @@ func (cv *ChatView) renderMarkdownTable(tableMarkdown string) fyne.CanvasObject 
 	if len(lines) < 2 {
 		return nil
 	}
-	
+
 	// Parse table rows
 	var rows [][]string
 	for i, line := range lines {
@@ -1549,7 +1711,7 @@ func (cv *ChatView) renderMarkdownTable(tableMarkdown string) fyne.CanvasObject 
 			// Skip separator line
 			continue
 		}
-		
+
 		// Split by | and clean up
 		cells := strings.Split(line, "|")
 		var cleanCells []string
@@ -1559,22 +1721,22 @@ func (cv *ChatView) renderMarkdownTable(tableMarkdown string) fyne.CanvasObject 
 				cleanCells = append(cleanCells, trimmed)
 			}
 		}
-		
+
 		if len(cleanCells) > 0 {
 			rows = append(rows, cleanCells)
 		}
 	}
-	
+
 	if len(rows) == 0 {
 		return nil
 	}
-	
+
 	// Get number of columns
 	numCols := len(rows[0])
-	
+
 	// Create table container
 	tableContainer := container.NewVBox()
-	
+
 	// Add header row (first row) with bold style
 	if len(rows) > 0 {
 		headerCells := []fyne.CanvasObject{}
@@ -1594,7 +1756,7 @@ func (cv *ChatView) renderMarkdownTable(tableMarkdown string) fyne.CanvasObject 
 		tableContainer.Add(headerRow)
 		tableContainer.Add(widget.NewSeparator())
 	}
-	
+
 	// Add data rows
 	for i := 1; i < len(rows); i++ {
 		dataCells := []fyne.CanvasObject{}
@@ -1615,7 +1777,7 @@ func (cv *ChatView) renderMarkdownTable(tableMarkdown string) fyne.CanvasObject 
 			tableContainer.Add(widget.NewSeparator())
 		}
 	}
-	
+
 	// Wrap in a bordered container for table appearance
 	return container.NewPadded(tableContainer)
 }
@@ -1624,10 +1786,10 @@ func (cv *ChatView) renderMarkdownTable(tableMarkdown string) fyne.CanvasObject 
 func (cv *ChatView) markdownToPlainText(markdown string) string {
 	// This is a simple conversion - removes common markdown syntax
 	text := markdown
-	
+
 	// Remove code blocks (```...```)
 	text = strings.ReplaceAll(text, "```", "")
-	
+
 	// Remove inline code (`...`)
 	for strings.Contains(text, "`") {
 		start := strings.Index(text, "`")
@@ -1637,13 +1799,13 @@ func (cv *ChatView) markdownToPlainText(markdown string) string {
 		}
 		text = text[:start] + text[start+1:start+1+end] + text[start+2+end:]
 	}
-	
+
 	// Remove bold (**...**)
 	text = strings.ReplaceAll(text, "**", "")
-	
+
 	// Remove italic (*...*)
 	text = strings.ReplaceAll(text, "*", "")
-	
+
 	// Remove headers (# )
 	lines := strings.Split(text, "\n")
 	for i, line := range lines {
@@ -1652,7 +1814,7 @@ func (cv *ChatView) markdownToPlainText(markdown string) string {
 		}
 	}
 	text = strings.Join(lines, "\n")
-	
+
 	// Remove links [text](url) -> text
 	for strings.Contains(text, "[") && strings.Contains(text, "](") {
 		start := strings.Index(text, "[")
@@ -1667,7 +1829,7 @@ func (cv *ChatView) markdownToPlainText(markdown string) string {
 		linkText := text[start+1 : start+middle]
 		text = text[:start] + linkText + text[start+middle+3+end:]
 	}
-	
+
 	return text
 }
 
@@ -1718,7 +1880,7 @@ func (cv *ChatView) regenerateMessage(messageIndex int) {
 			Content: anonymizedContent,
 		})
 	}
-	
+
 	// Log anonymization stats if enabled
 	if cv.app.anonymizer.IsEnabled() {
 		mappingCount := cv.app.anonymizer.GetMappingCount()
@@ -1740,9 +1902,9 @@ func (cv *ChatView) regenerateMessage(messageIndex int) {
 	assistantRichText.Wrapping = fyne.TextWrapBreak
 	assistantRoleLabel := widget.NewLabel("🤖 助手 (" + cv.currentProvider + ")")
 	assistantRoleLabel.TextStyle = fyne.TextStyle{Bold: true}
-	
+
 	assistantRichText.ParseMarkdown("*重新生成中...*")
-	
+
 	fyne.Do(func() {
 		cv.messagesContainer.Add(container.NewVBox(
 			assistantRoleLabel,
@@ -1825,64 +1987,64 @@ func (cv *ChatView) regenerateMessage(messageIndex int) {
 			}
 
 			if chunk.Done {
-    // Deanonymize the final response before saving
-    finalResponse := cv.app.anonymizer.Deanonymize(fullResponse.String())
-    
-    // Save new assistant message (with original sensitive data restored)
-    assistantMsg, err := cv.app.db.CreateMessage(
-        cv.conversationID,
-        "assistant",
-        finalResponse,
-        cv.currentProvider,
-        cv.currentProvider,
-        "",
-        0,
-    )
-    if err != nil {
-        cv.app.logger.Error("Failed to save assistant message: %v", err)
-    } else {
-        // 【关键修改】：直接更新UI而不是重新加载
-        fyne.Do(func() {
-            // 获取最后一个消息的索引
-            lastIndex := len(cv.messagesContainer.Objects) - 1
-            if lastIndex >= 0 {
-                // 重新加载消息数组以获取最新数据
-                dbMessages, err := cv.app.db.ListMessages(cv.conversationID)
-                if err == nil {
-                    cv.messages = make([]db.Message, len(dbMessages))
-                    for i, msg := range dbMessages {
-                        cv.messages[i] = *msg
-                    }
-                    cv.syncShowAnonymizedMap()
-                    
-                    // 创建完整的消息UI（包含所有按钮）
-                    messageIndex := len(cv.messages) - 1
-                    completeMessageUI := cv.buildMessageUI(assistantMsg, messageIndex)
-                    
-                    // 替换临时UI
-                    cv.messagesContainer.Objects[lastIndex] = completeMessageUI
-                    cv.messagesContainer.Refresh()
-                    
-                    // 更新缓存
-                    cv.app.messageCache[cv.conversationID] = dbMessages
-                    cv.app.uiCache[cv.conversationID] = append([]fyne.CanvasObject{}, cv.messagesContainer.Objects...)
-                    cv.app.updateCacheAccess(cv.conversationID)
-                }
-            }
-        })
-    }
-    
-    // Clear anonymization mappings for next conversation turn
-    cv.app.anonymizer.Clear()
-    
-    // Auto-generate title if needed
-    utils.SafeGo(cv.app.logger, "autoGenerateTitle", cv.autoGenerateTitle)
-    
-    // 【删除这一行】：不要重新加载消息
-    // cv.loadMessages()
-    
-    break
-}
+				// Deanonymize the final response before saving
+				finalResponse := cv.app.anonymizer.Deanonymize(fullResponse.String())
+
+				// Save new assistant message (with original sensitive data restored)
+				assistantMsg, err := cv.app.db.CreateMessage(
+					cv.conversationID,
+					"assistant",
+					finalResponse,
+					cv.currentProvider,
+					cv.currentProvider,
+					"",
+					0,
+				)
+				if err != nil {
+					cv.app.logger.Error("Failed to save assistant message: %v", err)
+				} else {
+					// 【关键修改】：直接更新UI而不是重新加载
+					fyne.Do(func() {
+						// 获取最后一个消息的索引
+						lastIndex := len(cv.messagesContainer.Objects) - 1
+						if lastIndex >= 0 {
+							// 重新加载消息数组以获取最新数据
+							dbMessages, err := cv.app.db.ListMessages(cv.conversationID)
+							if err == nil {
+								cv.messages = make([]db.Message, len(dbMessages))
+								for i, msg := range dbMessages {
+									cv.messages[i] = *msg
+								}
+								cv.syncShowAnonymizedMap()
+
+								// 创建完整的消息UI（包含所有按钮）
+								messageIndex := len(cv.messages) - 1
+								completeMessageUI := cv.buildMessageUI(assistantMsg, messageIndex)
+
+								// 替换临时UI
+								cv.messagesContainer.Objects[lastIndex] = completeMessageUI
+								cv.messagesContainer.Refresh()
+
+								// 更新缓存
+								cv.app.messageCache[cv.conversationID] = dbMessages
+								cv.app.uiCache[cv.conversationID] = append([]fyne.CanvasObject{}, cv.messagesContainer.Objects...)
+								cv.app.updateCacheAccess(cv.conversationID)
+							}
+						}
+					})
+				}
+
+				// Clear anonymization mappings for next conversation turn
+				cv.app.anonymizer.Clear()
+
+				// Auto-generate title if needed
+				utils.SafeGo(cv.app.logger, "autoGenerateTitle", cv.autoGenerateTitle)
+
+				// 【删除这一行】：不要重新加载消息
+				// cv.loadMessages()
+
+				break
+			}
 		}
 	})
 }
@@ -1892,7 +2054,7 @@ func (cv *ChatView) RefreshProviderList() {
 	if cv.providerSelect == nil {
 		return
 	}
-	
+
 	// Get current providers
 	providerOptions := []string{}
 	for name := range cv.app.providers {
@@ -1901,10 +2063,10 @@ func (cv *ChatView) RefreshProviderList() {
 	if len(providerOptions) == 0 {
 		providerOptions = []string{"请在配置文件中启用 LLM 提供商"}
 	}
-	
+
 	// Update select options
 	cv.providerSelect.Options = providerOptions
-	
+
 	// Update current selection if needed
 	if cv.currentProvider == "" || !cv.providerExists(cv.currentProvider) {
 		if len(providerOptions) > 0 && providerOptions[0] != "请在配置文件中启用 LLM 提供商" {
@@ -1915,7 +2077,7 @@ func (cv *ChatView) RefreshProviderList() {
 		// Keep current selection
 		cv.providerSelect.SetSelected(cv.currentProvider)
 	}
-	
+
 	cv.providerSelect.Refresh()
 	cv.app.logger.Info("Provider list refreshed, %d providers available", len(providerOptions))
 }
@@ -2074,21 +2236,21 @@ func (cv *ChatView) deleteMessage(messageIndex int) {
 
 // updateCacheAfterNewMessage updates the cache immediately after a new message is added
 func (cv *ChatView) updateCacheAfterNewMessage(newMessage db.Message) {
-    if cv.conversationID == 0 {
-        return
-    }
-    
-    cv.app.logger.Debug("Updating cache after new message")
-    
-    // Update message cache
-    if cachedMessages, exists := cv.app.messageCache[cv.conversationID]; exists {
-        // Add to existing cache
-        cv.app.messageCache[cv.conversationID] = append(cachedMessages, &newMessage)
-    } else {
-        // Create new cache
-        cv.app.messageCache[cv.conversationID] = []*db.Message{&newMessage}
-    }
-    
-    cv.app.updateCacheAccess(cv.conversationID)
-    cv.app.logger.Debug("Message cache updated")
+	if cv.conversationID == 0 {
+		return
+	}
+
+	cv.app.logger.Debug("Updating cache after new message")
+
+	// Update message cache
+	if cachedMessages, exists := cv.app.messageCache[cv.conversationID]; exists {
+		// Add to existing cache
+		cv.app.messageCache[cv.conversationID] = append(cachedMessages, &newMessage)
+	} else {
+		// Create new cache
+		cv.app.messageCache[cv.conversationID] = []*db.Message{&newMessage}
+	}
+
+	cv.app.updateCacheAccess(cv.conversationID)
+	cv.app.logger.Debug("Message cache updated")
 }

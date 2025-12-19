@@ -1061,6 +1061,8 @@ func (sv *SettingsView) savePrivacyConfig() {
 		sv.showError("保存匿名化设置失败: " + err.Error())
 		return
 	}
+	// Apply changes immediately (no restart required)
+	sv.app.ApplyPrivacyConfig()
 	sv.app.logger.Info("Privacy settings updated")
 }
 

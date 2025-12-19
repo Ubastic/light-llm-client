@@ -110,6 +110,14 @@ func NewApp(config *utils.Config, configPath string, database *db.DB, logger *ut
 	return application
 }
 
+// ApplyPrivacyConfig applies the current privacy config to runtime components.
+func (a *App) ApplyPrivacyConfig() {
+	if a.anonymizer == nil || a.config == nil {
+		return
+	}
+	a.anonymizer.UpdateConfig(a.config.Privacy)
+}
+
 // initProviders initializes LLM providers from config
 func (a *App) initProviders() {
 	// Iterate through all providers in config
