@@ -229,49 +229,22 @@ func (e *customEntry) TypedKey(key *fyne.KeyEvent) {
 	e.Entry.TypedKey(key)
 }
 
-// newSelectableText creates a selectable text widget using RichText for plain text
-// RichText naturally supports text selection and has no borders
-// This function does NOT parse markdown - use for user messages
-func newSelectableText(text string) *widget.RichText {
-	richText := widget.NewRichText()
-	richText.Wrapping = fyne.TextWrapBreak
-
-	// Always use plain text segment - do NOT parse markdown
-	// This prevents Fyne's markdown parser bugs from causing layout issues
-	segment := &widget.TextSegment{
-		Text:  text,
-		Style: widget.RichTextStyle{},
-	}
-	richText.Segments = []widget.RichTextSegment{segment}
-	richText.Refresh()
-
-	return richText
+// newSelectableText creates a read-only, selectable text widget.
+// Supports drag selection and right-click copy (via Fyne's selectable Label).
+func newSelectableText(text string) *widget.Label {
+	label := widget.NewLabel(text)
+	label.Wrapping = fyne.TextWrapBreak
+	label.Selectable = true
+	return label
 }
 
-// newSelectableMarkdownText creates a selectable text widget with markdown parsing
-// Use this for assistant messages that need markdown formatting
-func newSelectableMarkdownText(text string) *widget.RichText {
-	richText := widget.NewRichText()
-	richText.Wrapping = fyne.TextWrapBreak
-
-	// Parse markdown for assistant messages
-	richText.ParseMarkdown(text)
-
-	return richText
-}
-
-// newSelectableCodeText creates a selectable text widget for code with monospace font
-func newSelectableCodeText(text string) *widget.RichText {
-	richText := widget.NewRichText()
-	richText.Wrapping = fyne.TextWrapBreak
-	// Create text segment with monospace style
-	segment := &widget.TextSegment{
-		Text:  text,
-		Style: widget.RichTextStyle{TextStyle: fyne.TextStyle{Monospace: true}},
-	}
-	richText.Segments = []widget.RichTextSegment{segment}
-	richText.Refresh()
-	return richText
+// newSelectableCodeText creates a read-only, selectable code text widget with monospace font.
+func newSelectableCodeText(text string) *widget.Label {
+	label := widget.NewLabel(text)
+	label.Wrapping = fyne.TextWrapBreak
+	label.TextStyle = fyne.TextStyle{Monospace: true}
+	label.Selectable = true
+	return label
 }
 
 // ChatView represents the chat interface
@@ -783,10 +756,12 @@ func (cv *ChatView) proceedWithMessage(content string, attachments []*llm.Attach
 			cv.app.logger.Error("Failed to update message original content: %v", err)
 		}
 
-		// Display the original content in UI
-		cv.addMessageToUI("user", originalContent, "", -1)
+		// Display original content in UI (while keeping anonymized content available for toggle)
+		cv.addMessageToUIWithOriginal("user", content, originalContent, "", -1)
 		// Update cache immediately after user message
-		cv.updateCacheAfterNewMessage(*message)
+		cacheMsg := *message
+		cacheMsg.OriginalContent = originalContent
+		cv.updateCacheAfterNewMessage(cacheMsg)
 	} else {
 		// No anonymization - save and display content as-is
 		message, err = cv.app.db.CreateMessage(cv.conversationID, "user", content, "", "", attachmentsJSON, 0)
@@ -1119,23 +1094,27 @@ func (cv *ChatView) buildMessageUI(msg *db.Message, messageIndex int) fyne.Canva
 
 	// Determine which content to display based on user preference
 	displayContent := msg.Content
-	if msg.OriginalContent != "" {
-		// If user has toggled to show anonymized content, use the current content
-		// Otherwise, prefer to show the original content
-		if messageIndex >= 0 && messageIndex < len(cv.messages) && cv.showAnonymized[messageIndex] {
+	if hasAnonymizedContent {
+		// If user has toggled to show anonymized content, use Content; otherwise show OriginalContent.
+		if cv.showAnonymized != nil && cv.showAnonymized[messageIndex] {
 			displayContent = msg.Content
 		} else {
 			displayContent = msg.OriginalContent
 		}
+	} else if msg.OriginalContent != "" {
+		// If original content exists but is identical to content, prefer showing original.
+		displayContent = msg.OriginalContent
 	}
 
 	var contentWidget fyne.CanvasObject
+	var userContentLabel *widget.Label
 	if msg.Role == "assistant" {
 		// Assistant messages: parse and render with code block copy buttons
 		contentWidget = cv.renderAssistantMessage(displayContent)
 	} else {
 		// User messages use selectable text
-		contentWidget = newSelectableText(displayContent)
+		userContentLabel = newSelectableText(displayContent)
+		contentWidget = userContentLabel
 	}
 
 	// Create action buttons
@@ -1161,7 +1140,11 @@ func (cv *ChatView) buildMessageUI(msg *db.Message, messageIndex int) fyne.Canva
 		idx := messageIndex
 
 		editButton := widget.NewButton("✏️ 编辑", func() {
-			cv.editMessage(idx, displayContent)
+			if userContentLabel != nil {
+				cv.editMessage(idx, userContentLabel.Text)
+			} else {
+				cv.editMessage(idx, displayContent)
+			}
 		})
 		editButton.Importance = widget.LowImportance
 
@@ -1174,7 +1157,11 @@ func (cv *ChatView) buildMessageUI(msg *db.Message, messageIndex int) fyne.Canva
 	} else {
 		// For user messages, add copy, edit, and delete buttons
 		copyButton := widget.NewButton("📋 复制", func() {
-			cv.app.window.Clipboard().SetContent(displayContent)
+			if userContentLabel != nil {
+				cv.app.window.Clipboard().SetContent(userContentLabel.Text)
+			} else {
+				cv.app.window.Clipboard().SetContent(displayContent)
+			}
 			cv.app.logger.Info("Message copied to clipboard")
 		})
 		copyButton.Importance = widget.LowImportance
@@ -1182,7 +1169,11 @@ func (cv *ChatView) buildMessageUI(msg *db.Message, messageIndex int) fyne.Canva
 		// Capture messageIndex in closure
 		idx := messageIndex
 		editButton := widget.NewButton("✏️ 编辑", func() {
-			cv.editMessage(idx, displayContent)
+			if userContentLabel != nil {
+				cv.editMessage(idx, userContentLabel.Text)
+			} else {
+				cv.editMessage(idx, displayContent)
+			}
 		})
 		editButton.Importance = widget.LowImportance
 
@@ -1196,22 +1187,45 @@ func (cv *ChatView) buildMessageUI(msg *db.Message, messageIndex int) fyne.Canva
 
 	// Add anonymization toggle button if message has both original and anonymized content
 	if hasAnonymizedContent {
+		// Safety: ensure map exists (handles edge cases / cached UI state)
+		if cv.showAnonymized == nil {
+			cv.showAnonymized = make(map[int]bool)
+		}
+
 		// Determine button text based on current state
 		buttonText := "👁️ 显示匿名化内容"
-		if messageIndex >= 0 && messageIndex < len(cv.messages) && cv.showAnonymized[messageIndex] {
+		if cv.showAnonymized[messageIndex] {
 			buttonText = "👁️ 显示原始内容"
 		}
 
 		// Create toggle button for switching between original and anonymized content
-		toggleButton := widget.NewButton(buttonText, func() {
-			// Toggle between original and anonymized content
-			cv.toggleMessageContent(messageIndex)
+		showAnonButtonText := strings.ReplaceAll(buttonText, "原始内容", "匿名化内容")
+		showOriginalButtonText := strings.ReplaceAll(buttonText, "匿名化内容", "原始内容")
+		originalText := msg.OriginalContent
+		anonymizedText := msg.Content
+		toggleIdx := messageIndex
+
+		var toggleButton *widget.Button
+		toggleButton = widget.NewButton(buttonText, func() {
+			cv.showAnonymized[toggleIdx] = !cv.showAnonymized[toggleIdx]
+
+			if userContentLabel == nil {
+				return
+			}
+
+			if cv.showAnonymized[toggleIdx] {
+				userContentLabel.SetText(anonymizedText)
+				toggleButton.SetText(showOriginalButtonText)
+			} else {
+				userContentLabel.SetText(originalText)
+				toggleButton.SetText(showAnonButtonText)
+			}
 		})
 		toggleButton.Importance = widget.LowImportance
 
 		// Add the toggle button to the action buttons
 		if actionButtons != nil {
-			actionButtons.Objects = append(actionButtons.Objects, toggleButton)
+			actionButtons.Add(toggleButton)
 		}
 	}
 
@@ -1250,44 +1264,6 @@ func (cv *ChatView) syncShowAnonymizedMap() {
 	cv.showAnonymized = newMap
 }
 
-// toggleMessageContent switches between original and anonymized content for a message
-func (cv *ChatView) toggleMessageContent(messageIndex int) {
-	if messageIndex < 0 || messageIndex >= len(cv.messages) {
-		return
-	}
-
-	msg := cv.messages[messageIndex]
-	if msg.OriginalContent == "" || msg.OriginalContent == msg.Content {
-		return // No anonymized content to toggle
-	}
-
-	// Toggle the display preference for this message
-	cv.showAnonymized[messageIndex] = !cv.showAnonymized[messageIndex]
-
-	// Reload the message to reflect the new state
-	cv.reloadMessage(messageIndex)
-}
-
-// reloadMessage reloads a specific message in the UI
-func (cv *ChatView) reloadMessage(messageIndex int) {
-	if messageIndex < 0 || messageIndex >= len(cv.messages) {
-		return
-	}
-
-	// Get the message to reload
-	msg := cv.messages[messageIndex]
-
-	// Create new message UI
-	newMessageUI := cv.buildMessageUI(&msg, messageIndex)
-
-	// Replace the old message UI with the new one
-	fyne.Do(func() {
-		// Remove the old message
-		cv.messagesContainer.Objects[messageIndex] = newMessageUI
-		cv.messagesContainer.Refresh()
-	})
-}
-
 // addMessageToUI adds a message to the UI
 // messageIndex is the index in the messages list, or -1 for new messages
 func (cv *ChatView) addMessageToUI(role, content, model string, messageIndex int) {
@@ -1312,6 +1288,29 @@ func (cv *ChatView) addMessageToUI(role, content, model string, messageIndex int
 	})
 }
 
+// addMessageToUIWithOriginal adds a message to the UI with optional original content for anonymization toggling.
+// content should be the stored content (e.g., anonymized), and originalContent is the original text.
+func (cv *ChatView) addMessageToUIWithOriginal(role, content, originalContent, model string, messageIndex int) {
+	msg := &db.Message{
+		Role:            role,
+		Content:         content,
+		OriginalContent: originalContent,
+		Model:           model,
+	}
+
+	// If this is a new message (messageIndex == -1), add it to cv.messages array
+	if messageIndex == -1 {
+		cv.addMessageToMessagesArray(*msg)
+		messageIndex = len(cv.messages) - 1
+	}
+
+	messageBox := cv.buildMessageUI(msg, messageIndex)
+	fyne.Do(func() {
+		cv.messagesContainer.Add(messageBox)
+		cv.messagesContainer.Refresh()
+	})
+}
+
 // renderAssistantMessage renders assistant message with code block copy buttons, tables, and thinking sections
 func (cv *ChatView) renderAssistantMessage(content string) fyne.CanvasObject {
 	// Aggressive quick path: if no special markers, render as plain text
@@ -1321,16 +1320,16 @@ func (cv *ChatView) renderAssistantMessage(content string) fyne.CanvasObject {
 	hasThinking := strings.Contains(content, "<think>")
 
 	if !hasCodeBlock && !hasTable && !hasThinking {
-		// Pure text message with markdown formatting
-		return newSelectableMarkdownText(content)
+		// Render raw content as selectable text (keeps original characters intact).
+		return newSelectableText(content)
 	}
 
 	// Parse content to find code blocks, tables, and thinking sections
 	parts := cv.parseMarkdownContent(content)
 
 	if len(parts) == 1 && parts[0].isCode == false && parts[0].isTable == false && parts[0].isThinking == false {
-		// No special content after parsing, use markdown text
-		return newSelectableMarkdownText(content)
+		// No special content after parsing, render raw content as selectable text.
+		return newSelectableText(content)
 	}
 
 	// Build UI with special sections
@@ -1385,9 +1384,9 @@ func (cv *ChatView) renderAssistantMessage(content string) fyne.CanvasObject {
 				contentContainer.Add(tableWidget)
 			}
 		} else {
-			// Regular content - use markdown text for assistant messages
+			// Regular content - render raw content as selectable text (keeps original characters intact).
 			if strings.TrimSpace(part.content) != "" {
-				contentContainer.Add(newSelectableMarkdownText(part.content))
+				contentContainer.Add(newSelectableText(part.content))
 			}
 		}
 	}
@@ -1398,7 +1397,7 @@ func (cv *ChatView) renderAssistantMessage(content string) fyne.CanvasObject {
 // createThinkingSection creates a collapsible thinking section
 func (cv *ChatView) createThinkingSection(thinkingContent string) fyne.CanvasObject {
 	// Create the thinking content widget (initially hidden)
-	thinkingText := newSelectableMarkdownText(thinkingContent)
+	thinkingText := newSelectableText(thinkingContent)
 	thinkingContainer := container.NewVBox(thinkingText)
 	thinkingContainer.Hide() // Initially hidden
 
@@ -1741,15 +1740,11 @@ func (cv *ChatView) renderMarkdownTable(tableMarkdown string) fyne.CanvasObject 
 	if len(rows) > 0 {
 		headerCells := []fyne.CanvasObject{}
 		for _, cell := range rows[0] {
-			// Create rich text with bold style for header
-			cellText := widget.NewRichText()
-			cellText.Wrapping = fyne.TextWrapWord
-			segment := &widget.TextSegment{
-				Text:  cell,
-				Style: widget.RichTextStyle{TextStyle: fyne.TextStyle{Bold: true}},
-			}
-			cellText.Segments = []widget.RichTextSegment{segment}
-			cellContainer := container.NewPadded(cellText)
+			cellLabel := widget.NewLabel(cell)
+			cellLabel.Wrapping = fyne.TextWrapWord
+			cellLabel.TextStyle = fyne.TextStyle{Bold: true}
+			cellLabel.Selectable = true
+			cellContainer := container.NewPadded(cellLabel)
 			headerCells = append(headerCells, cellContainer)
 		}
 		headerRow := container.NewGridWithColumns(numCols, headerCells...)
